@@ -1,0 +1,12 @@
+[package]
+name = "p1-logger"
+version = "0.1.0"
+edition = "2024"
+default-run = "p1-logger"
+
+[dependencies]
+serialport = { version = "4", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+log = "0.4.33"
+syslog = "7.0.0"

@@ -1,0 +1,16 @@
+[Unit]
+Description=P1 smart meter logger
+After=local-fs.target
+
+[Service]
+Type=simple
+User=flippo
+WorkingDirectory=/home/flippo
+ExecStart=/home/flippo/bin/p1-logger /dev/serial0 --data-dir /home/flippo/p1-data -l -q --bad-telegram-dir /tmp/p1-bad-telegrams
+# "always", not "on-failure": the read loop only exits on EOF/error, and an
+# EOF from the serial device is not a state we want to just sit dead in.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Run from the script's own directory, so `.env` and the relative paths
+# below (target/, systemd/) work regardless of the caller's working
+# directory. `cd` resolves $PWD to an absolute path either way, even
+# given a relative dirname.
+cd "$(dirname "$0")"
+
+PI_TARGET="aarch64-unknown-linux-gnu"
+PI_HOST=
+DEPLOY_PATH="~/bin/p1-logger"
+if [ -f .env ]; then
+    . .env
+fi
+
+usage() {
+    cat <<EOF
+Usage:
+  ./run <file>          Run p1-logger against <file> (device path or plain file)
+  ./run build-dev       cargo build (debug, native)
+  ./run build-release   cargo build --release (native)
+  ./run build-pi        cross-compile release build for the Pi ($PI_TARGET)
+  ./run deploy          build-pi, then scp the binary + systemd unit to $PI_HOST
+  ./run help            Show this usage
+EOF
+}
+
+case "${1:-help}" in
+    help | -h | --help)
+        usage
+        ;;
+    build-dev)
+        cargo build
+        ;;
+    build-release)
+        cargo build --release
+        ;;
+    build-pi)
+        cross build --release --target "$PI_TARGET"
+        ;;
+    deploy)
+        "$0" build-pi
+        # Upload to a temp name, then rename into place: overwriting the
+        # live binary's path in-place fails with ETXTBSY while the systemd
+        # service has it open. A rename only swaps the directory entry, so
+        # the running process (still on the old inode) is untouched.
+        scp "target/$PI_TARGET/release/p1-logger" "$PI_HOST:${DEPLOY_PATH}.new"
+        ssh "$PI_HOST" "mv ${DEPLOY_PATH}.new ${DEPLOY_PATH}"
+        scp systemd/p1-logger.service "$PI_HOST:~/p1-logger.service"
+        cat <<EOF
+
+Binary + unit file deployed. One-time install on $PI_HOST (needs sudo):
+  sudo mv ~/p1-logger.service /etc/systemd/system/p1-logger.service
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now p1-logger
+After that, redeploys just need a: sudo systemctl restart p1-logger
+EOF
+        ;;
+    *)
+        cargo run --quiet -- "$@"
+        ;;
+esac
