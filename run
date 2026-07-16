@@ -9,11 +9,14 @@ cd "$(dirname "$0")"
 
 PI_TARGET="aarch64-unknown-linux-gnu"
 PI_HOST=
-DEPLOY_PATH="~/bin/p1-logger"
+PI_USER=
+DEPLOY_PATH=
 if [ -f .env ]; then
     . .env
 fi
-
+if [ -z "$DEPLOY_PATH" ]; then
+    DEPLOY_PATH="/home/$PI_USER/bin/p1-logger"
+fi
 usage() {
     cat <<EOF
 Usage:
@@ -40,18 +43,32 @@ case "${1:-help}" in
         cross build --release --target "$PI_TARGET"
         ;;
     deploy)
+        if [ -z "$PI_HOST" ] || [ -z "$PI_USER" ]; then
+            echo "error: PI_HOST and PI_USER must be set in .env" >&2
+            exit 1
+        fi
         "$0" build-pi
+        # /home/$PI_USER/bin must exist before scp can land the binary in it; /home/$PI_USER/p1-data
+        # doesn't need the same treatment, the daemon creates that itself
+        # on first start.
+        ssh "$PI_HOST" "mkdir -p /home/$PI_USER/bin"
         # Upload to a temp name, then rename into place: overwriting the
         # live binary's path in-place fails with ETXTBSY while the systemd
         # service has it open. A rename only swaps the directory entry, so
         # the running process (still on the old inode) is untouched.
         scp "target/$PI_TARGET/release/p1-logger" "$PI_HOST:${DEPLOY_PATH}.new"
         ssh "$PI_HOST" "mv ${DEPLOY_PATH}.new ${DEPLOY_PATH}"
-        scp systemd/p1-logger.service "$PI_HOST:~/p1-logger.service"
+        # systemd/p1-logger.service is a template committed to the repo
+        # (placeholders, no username/paths); fill in the real user from
+        # .env only at deploy time, into a throwaway rendered copy.
+        rendered="$(mktemp)"
+        sed "s|__PI_USER__|$PI_USER|g" systemd/p1-logger.service > "$rendered"
+        scp "$rendered" "$PI_HOST:/home/$PI_USER/p1-logger.service"
+        rm -f "$rendered"
         cat <<EOF
 
 Binary + unit file deployed. One-time install on $PI_HOST (needs sudo):
-  sudo mv ~/p1-logger.service /etc/systemd/system/p1-logger.service
+  sudo mv /home/$PI_USER/p1-logger.service /etc/systemd/system/p1-logger.service
   sudo systemctl daemon-reload
   sudo systemctl enable --now p1-logger
 After that, redeploys just need a: sudo systemctl restart p1-logger

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 pub const USAGE: &str =
-    "usage: p1-logger <serial-device-or-file> [--data-dir <dir>] [--bad-telegram-dir <dir>] [-d] [-l] [-q]";
+    "usage: p1-logger <serial-device-or-file> --data-dir <dir> [--bad-telegram-dir <dir>] [-d] [-l] [-q]";
 
 #[derive(Debug, PartialEq)]
 pub struct Args {
@@ -45,7 +45,7 @@ pub fn parse_args(raw: &[String]) -> Result<Args, String> {
 
     Ok(Args {
         source_path: source_path.ok_or("missing <serial-device-or-file>")?,
-        data_dir: data_dir.unwrap_or_else(|| PathBuf::from("data")),
+        data_dir: data_dir.ok_or("missing --data-dir")?,
         bad_telegram_dir,
         debug,
         want_syslog,
@@ -84,6 +84,14 @@ mod tests {
     #[test]
     fn rejects_missing_source_path() {
         assert_eq!(args(&["-d"]), Err("missing <serial-device-or-file>".to_string()));
+    }
+
+    #[test]
+    fn rejects_missing_data_dir() {
+        assert_eq!(
+            args(&["/dev/serial0"]),
+            Err("missing --data-dir".to_string())
+        );
     }
 
     #[test]

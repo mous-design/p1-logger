@@ -4,9 +4,9 @@ After=local-fs.target
 
 [Service]
 Type=simple
-User=flippo
-WorkingDirectory=/home/flippo
-ExecStart=/home/flippo/bin/p1-logger /dev/serial0 --data-dir /home/flippo/p1-data -l -q --bad-telegram-dir /tmp/p1-bad-telegrams
+User=__PI_USER__
+WorkingDirectory=/home/__PI_USER__
+ExecStart=/home/__PI_USER__/bin/p1-logger /dev/serial0 --data-dir /home/__PI_USER__/p1-data -l -q --bad-telegram-dir /tmp/p1-bad-telegrams
 # "always", not "on-failure": the read loop only exits on EOF/error, and an
 # EOF from the serial device is not a state we want to just sit dead in.
 Restart=always
