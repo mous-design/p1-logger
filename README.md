@@ -6,8 +6,12 @@ SQLite — one file per UTC calendar day. Built to run unattended for months:
 crash-safe writes (WAL), a read loop that never blocks on disk I/O, and
 graceful handling of the line noise a real P1 cable might pick up.
 
-The eventual goal is per-minute/per-day aggregates and simple switching logic
-(water heater, diverter valve, washing machine) based on momentary surplus/deficit from solar.
+A second binary, `p1-aggregate`, runs hourly via cron: it turns the raw
+per-second readings into per-minute/per-day power aggregates and hourly
+meter-reading snapshots (`data/aggregates.sqlite3`), then archives the raw
+day-files it's fully processed. The eventual goal beyond that is simple
+switching logic (water heater, diverter valve, washing machine) based on
+momentary surplus/deficit from solar.
 
 ## How it's put together
 
@@ -22,10 +26,23 @@ The eventual goal is per-minute/per-day aggregates and simple switching logic
 - `src/io_source.rs` — opens a path as a live serial port if it's a character
   device, or reads it as a plain file otherwise. Lets the exact same binary
   run against real hardware or a captured telegram file for testing.
-- `src/args.rs` — CLI argument parsing.
-- `src/main.rs` — setup and glue only: parses args, wires up logging, spawns
-  a writer thread connected to the reader via an unbounded channel (so a slow
-  SD card can never stall the UART read), and dispatches `TelegramEvent`s.
+- `src/args.rs` — CLI argument parsing for `p1-logger`.
+- `src/aggregate.rs` — the aggregation math (bucketing min/avg/max, hourly
+  meter-reading snapshots) and the `power_1min`/`power_1day`/
+  `meter_electricity`/`meter_gas` schema in `aggregates.sqlite3`. Pure,
+  DB-independent functions where possible, so the bucketing logic is unit
+  tested without touching SQLite at all.
+- `src/lib.rs` — re-exports the modules above so both binaries can share
+  them.
+- `src/main.rs` — `p1-logger`: setup and glue only. Parses args, wires up
+  logging, spawns a writer thread connected to the reader via an unbounded
+  channel (so a slow SD card can never stall the UART read), and dispatches
+  `TelegramEvent`s.
+- `src/bin/p1-aggregate.rs` — `p1-aggregate`: scans `data/` for day-files,
+  computes and writes that day's aggregates in one transaction (idempotent:
+  delete then insert, so a re-run or a mid-run crash never needs special
+  handling), and archives the raw file to `data/processed/` once it's a
+  completed (non-today) day.
 
 ## Building and running
 
@@ -34,14 +51,18 @@ The eventual goal is per-minute/per-day aggregates and simple switching logic
 ./run build-dev                # cargo build (debug, native)
 ./run build-release            # cargo build --release (native)
 ./run build-pi                 # cross-compile for the Pi (aarch64-unknown-linux-gnu, via `cross`)
-./run deploy                   # build-pi, then scp the binary + systemd unit to the Pi
+./run deploy                   # build-pi, then scp both binaries + the systemd unit
+                                #   + the cron.d template to the Pi
 ```
 
-`./run deploy` reads `PI_HOST`/`PI_USER`/`DEPLOY_PATH` from a local `.env`
-file (gitignored) — `PI_USER` (e.g. `john`) is substituted into
-[systemd/p1-logger.service](systemd/p1-logger.service)'s `__PI_USER__`
-placeholder at deploy time (used for both `User=` and the `/home/__PI_USER__`
-paths), so the committed unit file carries no personal username or paths.
+`./run deploy` reads `PI_HOST`/`PI_USER`/`DEPLOY_PATH`/`RETENTION_DAYS` from
+a local `.env` file (gitignored) — `PI_USER` (e.g. `john`) is substituted
+into both [systemd/p1-logger.service](systemd/p1-logger.service)'s and
+[cron.d/p1-aggregate](cron.d/p1-aggregate)'s `__PI_USER__` placeholder at
+deploy time (used for both `User=` and the `/home/__PI_USER__` paths), so
+neither committed template carries a personal username or path.
+`RETENTION_DAYS` (optional) is substituted into the cron template's
+`--retention-days` flag the same way — see below.
 
 ### CLI flags
 
@@ -59,6 +80,28 @@ p1-logger <serial-device-or-file> --data-dir <dir> [--bad-telegram-dir <dir>] [-
 - `-d` — also print every parsed record to stderr (testing).
 - `-l` — send warnings/errors also to syslog (`/dev/log`).
 - `-q` — suppress stderr entirely. Normal unattended operation is `-l -q`.
+
+```
+p1-aggregate --data-dir <dir> [--retention-days <n>] [-l] [-q]
+```
+
+- `--data-dir` — required, same directory `p1-logger` writes its day-files
+  into. `p1-aggregate` scans it for day-files, folds each completed day into
+  `aggregates.sqlite3`, then moves the raw file into `<dir>/processed/`.
+  Meant to run hourly via cron (see below) — re-running it is cheap and
+  idempotent, so there's no harm running it more often than a day actually
+  closes.
+- `--retention-days` — optional; if set, every run also deletes archived
+  raw day-files in `<dir>/processed/` older than this many days. The raw
+  per-second data runs ~56MB/day, so left unbounded it eventually fills the
+  Pi's SD card; `aggregates.sqlite3` itself stays tiny (tens of MB/year)
+  and is never touched by this. Left unset, nothing is ever pruned. Set via
+  `RETENTION_DAYS` in `.env` — `./run deploy` renders it into the cron
+  template, so the retention window is a deploy-time decision, not
+  something baked into the binary.
+- `-l` / `-q` — same meaning as `p1-logger`'s own flags: send to syslog,
+  suppress stderr. Off by default (handy when running by hand); the cron
+  template passes `-l -q`, matching `p1-logger.service`'s own convention.
 
 ## Hardware: reading the P1 port
 
@@ -154,21 +197,32 @@ Test:
 cat /dev/serial0
 ```
 
-
-## Deploying as a service
+## Deploying
 
 ```bash
 ./run deploy
 ```
 
-Then, one-time on the Pi:
+That builds both binaries, copies them to the Pi, and copies over the
+rendered systemd unit and cron.d template — but neither takes effect until
+the one-time install step below is run once on the Pi (needs `sudo`; `./run
+deploy` prints the exact same commands after it finishes):
 
 ```bash
 sudo mv ~/p1-logger.service /etc/systemd/system/p1-logger.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now p1-logger
+
+sudo mv ~/p1-aggregate.cron /etc/cron.d/p1-aggregate
+sudo chown root:root /etc/cron.d/p1-aggregate
+sudo chmod 644 /etc/cron.d/p1-aggregate
 ```
 
-After that, `./run deploy` + `sudo systemctl restart p1-logger` is all a
-redeploy needs. See [systemd/p1-logger.service](systemd/p1-logger.service)
-for the unit itself (`Restart=always`, runs as an unprivileged user).
+`/etc/cron.d` files are silently ignored unless owned by root and not
+group/world-writable, which is why the `chown`/`chmod` above aren't optional.
+
+After that, redeploys just need `./run deploy` + `sudo systemctl restart
+p1-logger` — cron picks up an updated `p1-aggregate` binary on its own next
+run, no reload needed. See [systemd/p1-logger.service](systemd/p1-logger.service)
+and [cron.d/p1-aggregate](cron.d/p1-aggregate) for the templates themselves
+(`Restart=always`, runs as an unprivileged user).

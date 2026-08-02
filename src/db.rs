@@ -81,11 +81,29 @@ fn open_day_file(dir: &Path, day: i64) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-fn day_file_path(dir: &Path, day: i64) -> PathBuf {
+pub fn day_file_path(dir: &Path, day: i64) -> PathBuf {
     let date = chrono::DateTime::from_timestamp(day * SECONDS_PER_DAY, 0)
         .expect("day number in representable range")
         .format("%Y-%m-%d");
     dir.join(format!("{date}.sqlite3"))
+}
+
+/// The reverse of `day_file_path`: reads the `YYYY-MM-DD` date out of a raw
+/// day-file's name and returns its UTC midnight as an epoch timestamp
+/// (`day_start`; the day's range is `[day_start, day_start + 86_400)`).
+/// `None` for anything that isn't one of our own day-files (e.g.
+/// `aggregates.sqlite3`), so callers can filter a directory listing with it.
+pub fn parse_day_file_name(path: &Path) -> Option<i64> {
+    // WAL mode leaves `<name>.sqlite3-wal`/`-shm` sidecar files next to the
+    // real database. Their `file_stem()` is still the plain date (stem-splitting
+    // only looks at the last '.'), so the extension must be checked too --
+    // otherwise those sidecars get scanned in as if they were day-files.
+    if path.extension().and_then(|ext| ext.to_str()) != Some("sqlite3") {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    let date = chrono::NaiveDate::parse_from_str(stem, "%Y-%m-%d").ok()?;
+    Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp())
 }
 
 #[cfg(test)]
@@ -98,6 +116,29 @@ mod tests {
             timestamp,
             records: vec![Record { kind, timestamp, value }],
         }
+    }
+
+    #[test]
+    fn parse_day_file_name_round_trips_with_day_file_path() {
+        let dir = Path::new("data");
+        let path = day_file_path(dir, 0); // epoch day 0 = 1970-01-01
+        assert_eq!(parse_day_file_name(&path), Some(0));
+
+        // 2026-07-12 14:31:15 UTC, same day used throughout the other tests
+        let day = 1_783_866_675_i64.div_euclid(SECONDS_PER_DAY);
+        let path = day_file_path(dir, day);
+        assert_eq!(parse_day_file_name(&path), Some(day * SECONDS_PER_DAY));
+    }
+
+    #[test]
+    fn parse_day_file_name_rejects_non_day_files() {
+        assert_eq!(parse_day_file_name(Path::new("data/aggregates.sqlite3")), None);
+    }
+
+    #[test]
+    fn parse_day_file_name_rejects_wal_and_shm_sidecar_files() {
+        assert_eq!(parse_day_file_name(Path::new("data/2026-07-31.sqlite3-wal")), None);
+        assert_eq!(parse_day_file_name(Path::new("data/2026-07-31.sqlite3-shm")), None);
     }
 
     #[test]

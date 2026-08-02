@@ -1,0 +1,18 @@
+# Runs the aggregator hourly. Re-running is cheap and idempotent (delete +
+# fresh insert per day), so "today" just gets progressively fresher
+# aggregates each hour rather than waiting for the day to fully close.
+#
+# /etc/cron.d files are ignored by cron unless owned by root and not
+# group/world-writable -- see the deploy instructions printed by `./run
+# deploy` for the exact `chown`/`chmod` needed after moving this into
+# place.
+#
+# The --retention-days flag below is filled in by `./run deploy` from
+# .env's RETENTION_DAYS (or left out entirely if unset, meaning: never
+# prune anything from processed/).
+#
+# -l -q: syslog only, same convention as p1-logger.service's own -l -q.
+# The log-file redirect below stays anyway as a safety net -- a failed
+# syslog connection itself panics before -q even takes effect, and a
+# panic message always goes to the real stderr regardless.
+5 * * * * __PI_USER__ /home/__PI_USER__/bin/p1-aggregate --data-dir /home/__PI_USER__/p1-data__RETENTION_FLAG__ -l -q >> /home/__PI_USER__/p1-data/p1-aggregate.log 2>&1

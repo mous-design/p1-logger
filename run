@@ -11,6 +11,7 @@ PI_TARGET="aarch64-unknown-linux-gnu"
 PI_HOST=
 PI_USER=
 DEPLOY_PATH=
+RETENTION_DAYS=
 if [ -f .env ]; then
     . .env
 fi
@@ -24,7 +25,8 @@ Usage:
   ./run build-dev       cargo build (debug, native)
   ./run build-release   cargo build --release (native)
   ./run build-pi        cross-compile release build for the Pi ($PI_TARGET)
-  ./run deploy          build-pi, then scp the binary + systemd unit to $PI_HOST
+  ./run deploy          build-pi, then scp both binaries + the systemd unit
+                        + the cron.d template to $PI_HOST
   ./run help            Show this usage
 EOF
 }
@@ -48,30 +50,49 @@ case "${1:-help}" in
             exit 1
         fi
         "$0" build-pi
-        # /home/$PI_USER/bin must exist before scp can land the binary in it; /home/$PI_USER/p1-data
-        # doesn't need the same treatment, the daemon creates that itself
-        # on first start.
+        # /home/$PI_USER/bin must exist before scp can land the binaries in
+        # it; /home/$PI_USER/p1-data doesn't need the same treatment, the
+        # daemon creates that itself on first start.
         ssh "$PI_HOST" "mkdir -p /home/$PI_USER/bin"
-        # Upload to a temp name, then rename into place: overwriting the
-        # live binary's path in-place fails with ETXTBSY while the systemd
-        # service has it open. A rename only swaps the directory entry, so
-        # the running process (still on the old inode) is untouched.
-        scp "target/$PI_TARGET/release/p1-logger" "$PI_HOST:${DEPLOY_PATH}.new"
-        ssh "$PI_HOST" "mv ${DEPLOY_PATH}.new ${DEPLOY_PATH}"
-        # systemd/p1-logger.service is a template committed to the repo
-        # (placeholders, no username/paths); fill in the real user from
-        # .env only at deploy time, into a throwaway rendered copy.
-        rendered="$(mktemp)"
-        sed "s|__PI_USER__|$PI_USER|g" systemd/p1-logger.service > "$rendered"
-        scp "$rendered" "$PI_HOST:/home/$PI_USER/p1-logger.service"
-        rm -f "$rendered"
+        # Upload to a temp name, then rename into place: overwriting a
+        # binary that's currently executing (the daemon, or a cron-invoked
+        # aggregate run) fails with ETXTBSY. A rename only swaps the
+        # directory entry, so anything mid-run (on the old inode) is
+        # untouched.
+        for bin in p1-logger p1-aggregate; do
+            scp "target/$PI_TARGET/release/$bin" "$PI_HOST:/home/$PI_USER/bin/$bin.new"
+            ssh "$PI_HOST" "mv /home/$PI_USER/bin/$bin.new /home/$PI_USER/bin/$bin"
+        done
+        # systemd/p1-logger.service and cron.d/p1-aggregate are templates
+        # committed to the repo (placeholders, no username/paths); fill in
+        # the real user from .env only at deploy time, into throwaway
+        # rendered copies.
+        rendered_service="$(mktemp)"
+        sed "s|__PI_USER__|$PI_USER|g" systemd/p1-logger.service > "$rendered_service"
+        scp "$rendered_service" "$PI_HOST:/home/$PI_USER/p1-logger.service"
+        rm -f "$rendered_service"
+
+        # RETENTION_DAYS is optional -- unset means the cron line gets no
+        # --retention-days flag at all, i.e. processed/ is never pruned.
+        retention_flag=
+        if [ -n "$RETENTION_DAYS" ]; then
+            retention_flag=" --retention-days $RETENTION_DAYS"
+        fi
+        rendered_cron="$(mktemp)"
+        sed -e "s|__PI_USER__|$PI_USER|g" -e "s|__RETENTION_FLAG__|$retention_flag|g" cron.d/p1-aggregate > "$rendered_cron"
+        scp "$rendered_cron" "$PI_HOST:/home/$PI_USER/p1-aggregate.cron"
+        rm -f "$rendered_cron"
         cat <<EOF
 
-Binary + unit file deployed. One-time install on $PI_HOST (needs sudo):
+Binaries + unit file + cron template deployed. One-time install on $PI_HOST (needs sudo):
   sudo mv /home/$PI_USER/p1-logger.service /etc/systemd/system/p1-logger.service
   sudo systemctl daemon-reload
   sudo systemctl enable --now p1-logger
+  sudo mv /home/$PI_USER/p1-aggregate.cron /etc/cron.d/p1-aggregate
+  sudo chown root:root /etc/cron.d/p1-aggregate
+  sudo chmod 644 /etc/cron.d/p1-aggregate
 After that, redeploys just need a: sudo systemctl restart p1-logger
+(cron picks up an updated p1-aggregate binary on its own next run, no reload needed)
 EOF
         ;;
     *)
