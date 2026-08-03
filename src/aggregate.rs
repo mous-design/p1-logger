@@ -39,6 +39,28 @@ fn read_series_sorted(conn: &Connection, kind: &str) -> rusqlite::Result<Vec<(i6
     stmt.query_map([kind], |row| Ok((row.get(0)?, row.get(1)?)))?.collect()
 }
 
+/// Collapses consecutive rows sharing the same timestamp down to the last
+/// one seen for it. `series` must already be sorted by timestamp (as
+/// `read_series_sorted` guarantees), so duplicates are always adjacent.
+///
+/// Real cause, confirmed by inspecting the raw data behind a batch of
+/// "no matching export" warnings: telegram timing jitter occasionally lands
+/// two transmissions on the same labelled second, while the neighbouring
+/// second goes empty -- the same underlying jitter as the long-known
+/// "missing seconds" gaps, just showing up as a double instead of a gap
+/// this time. Without this, a duplicate silently desyncs `net_series_sorted`
+/// even though the intent (keep the freshest reading) is unambiguous.
+fn dedup_last_per_timestamp(series: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    let mut result: Vec<(i64, i64)> = Vec::with_capacity(series.len());
+    for (timestamp, value) in series {
+        match result.last_mut() {
+            Some((last_timestamp, last_value)) if *last_timestamp == timestamp => *last_value = value,
+            _ => result.push((timestamp, value)),
+        }
+    }
+    result
+}
+
 /// Pairs up `import_kind`/`export_kind` rows sharing the same timestamp into
 /// a signed, timestamp-ordered net series (positive = import, negative =
 /// export). Used for net power (P-import/P-export) and, identically, for
@@ -60,9 +82,14 @@ fn net_series_sorted(
     export_kind: &str,
     quiet: bool,
 ) -> rusqlite::Result<Vec<(i64, i64)>> {
-    let imports = read_series_sorted(conn, import_kind)?;
-    // For exports: convert vec to hashmap for O(1) lookup:
-    let mut exports: HashMap<i64, i64> = read_series_sorted(conn, export_kind)?.into_iter().collect();
+    let imports = dedup_last_per_timestamp(read_series_sorted(conn, import_kind)?);
+    // For exports: convert vec to hashmap for O(1) lookup. Explicit dedup
+    // here too even though collect() into a HashMap already keeps only the
+    // last value per key by itself -- doing it via the same named function
+    // as imports makes that "last wins" choice visible, not an incidental
+    // side effect of picking a HashMap.
+    let mut exports: HashMap<i64, i64> =
+        dedup_last_per_timestamp(read_series_sorted(conn, export_kind)?).into_iter().collect();
 
     let mut net = Vec::with_capacity(imports.len());
     for (timestamp, import) in imports {
@@ -250,13 +277,15 @@ fn distance_outside_range(bucket_start: i64, day_start: i64, day_end: i64) -> i6
 /// lag behind the telegram timestamp that decided which day-file they were
 /// written to -- the meter's M-Bus push only updates the gas value/timestamp
 /// occasionally, so every telegram in between keeps repeating the same
-/// stale one. Observed in production: up to ~5 minutes of lag right at a
-/// day boundary. Half an hour of tolerance is already generous room above
-/// that, while still flagging anything further off (which would point at a
-/// real bug, not this expected lag) as an actual anomaly. If real lag ever
-/// turns out to exceed this, worst case is a few more log lines -- easy to
-/// widen.
-const GAS_BOUNDARY_TOLERANCE_SECONDS: i64 = SECONDS_PER_HOUR / 2;
+/// stale one. A single hand-picked example first suggested ~5 minutes of
+/// lag, but re-running against 19 real days showed the actual pattern is
+/// much more mechanical: the meter updates gas on a fixed hourly schedule,
+/// so right after midnight the last-known reading is consistently exactly
+/// ~1 hour stale (the previous day's 23:00 update), every single day, not
+/// just occasionally. 2 hours of tolerance covers that with real room to
+/// spare, while still flagging anything further off (which would point at
+/// a real bug, not this expected lag) as an actual anomaly.
+const GAS_BOUNDARY_TOLERANCE_SECONDS: i64 = 2 * SECONDS_PER_HOUR;
 
 /// Replaces one day's worth of aggregate rows in a single transaction:
 /// idempotent by construction (delete then insert, not "insert if
@@ -610,5 +639,43 @@ mod tests {
         let quiet = net_series_sorted(&conn, "P-import", "P-export", true).unwrap();
         assert_eq!(loud, quiet);
         assert_eq!(loud, vec![(0, 100)], "the orphaned P-import must still be skipped, quiet or not");
+    }
+
+    #[test]
+    fn dedup_last_per_timestamp_keeps_only_the_final_value_per_duplicate() {
+        let series = vec![(0, 1), (5, 10), (5, 20), (5, 30), (6, 100)];
+        assert_eq!(dedup_last_per_timestamp(series), vec![(0, 1), (5, 30), (6, 100)]);
+    }
+
+    #[test]
+    fn net_series_sorted_handles_a_duplicate_timestamp_without_warning_worthy_mismatch() {
+        // Reproduces a real production case: telegram timing jitter landed
+        // two readings on the same labelled second (1784183542) -- import
+        // duplicated with the same value, export duplicated with two
+        // *different* values, exactly like the raw data behind the original
+        // "no matching P-export" warnings. Before dedup_last_per_timestamp,
+        // the second (duplicate) import row found the export HashMap
+        // already drained by the first one and warned; after, both sides
+        // collapse to their last value before pairing, so this nets
+        // cleanly with no mismatch at all.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE readings (type TEXT NOT NULL, timestamp INTEGER NOT NULL, value INTEGER NOT NULL);")
+            .unwrap();
+        let insert = |kind: &str, timestamp: i64, value: i64| {
+            conn.execute("INSERT INTO readings (type, timestamp, value) VALUES (?1, ?2, ?3)", (kind, timestamp, value))
+                .unwrap();
+        };
+
+        insert("P-import", 1, 0);
+        insert("P-export", 1, 135);
+        insert("P-import", 2, 0);
+        insert("P-import", 2, 0); // duplicate telegram, same value
+        insert("P-export", 2, 135);
+        insert("P-export", 2, 133); // duplicate telegram, different value -- last one should win
+        insert("P-import", 4, 0);
+        insert("P-export", 4, 136);
+
+        let net = net_series_sorted(&conn, "P-import", "P-export", false).unwrap();
+        assert_eq!(net, vec![(1, -135), (2, -133), (4, -136)], "timestamp 2 should net using the last export value, once");
     }
 }
