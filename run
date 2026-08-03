@@ -27,6 +27,10 @@ Usage:
   ./run build-pi        cross-compile release build for the Pi ($PI_TARGET)
   ./run deploy          build-pi, then scp both binaries + the systemd unit
                         + the cron.d template to $PI_HOST
+  ./run view-log <type> [-f]
+                        Show recent logs from $PI_HOST via journalctl.
+                        <type> is one of: p1-logger, p1-aggregate
+                        -f follows (like tail -f), Ctrl-C to stop.
   ./run help            Show this usage
 EOF
 }
@@ -94,6 +98,37 @@ Binaries + unit file + cron template deployed. One-time install on $PI_HOST (nee
 After that, redeploys just need a: sudo systemctl restart p1-logger
 (cron picks up an updated p1-aggregate binary on its own next run, no reload needed)
 EOF
+        ;;
+    view-log)
+        if [ -z "$PI_HOST" ]; then
+            echo "error: PI_HOST must be set in .env" >&2
+            exit 1
+        fi
+        follow_flag=
+        if [ "${3:-}" = "-f" ]; then
+            follow_flag="-f"
+        fi
+        # -t allocates a pseudo-terminal: without it, Ctrl-C on a following
+        # (-f) journalctl doesn't reliably reach the remote process.
+        case "${2:-}" in
+            # p1-logger runs under systemd, so -u (unit) picks up everything
+            # associated with that service, including start/stop/restart
+            # events -- not just what it itself logged.
+            p1-logger)
+                ssh -t "$PI_HOST" "journalctl -u p1-logger -n 200 --no-pager $follow_flag"
+                ;;
+            # p1-aggregate is a cron job, not a systemd unit, so there's no
+            # unit to filter by -- -t (syslog identifier) is what both
+            # binaries are tagged with, set in logging::init_logging.
+            p1-aggregate)
+                ssh -t "$PI_HOST" "journalctl -t p1-aggregate -n 200 --no-pager $follow_flag"
+                ;;
+            *)
+                echo "error: unknown log type '${2:-}'" >&2
+                echo "usage: ./run view-log <p1-logger|p1-aggregate> [-f]" >&2
+                exit 1
+                ;;
+        esac
         ;;
     *)
         cargo run --quiet -- "$@"

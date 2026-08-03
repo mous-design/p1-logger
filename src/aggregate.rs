@@ -15,10 +15,8 @@ pub struct PowerBucket {
 
 pub struct ElectricityMeterBucket {
     pub bucket_start: i64,
-    pub import_t1_wh: i64,
-    pub import_t2_wh: i64,
-    pub export_t1_wh: i64,
-    pub export_t2_wh: i64,
+    pub net_t1_wh: i64,
+    pub net_t2_wh: i64,
 }
 
 pub struct GasMeterBucket {
@@ -41,32 +39,51 @@ fn read_series_sorted(conn: &Connection, kind: &str) -> rusqlite::Result<Vec<(i6
     stmt.query_map([kind], |row| Ok((row.get(0)?, row.get(1)?)))?.collect()
 }
 
-/// Pairs up P-import/P-export rows sharing the same timestamp into a signed,
-/// timestamp-ordered net-power series (positive = import, negative =
-/// export). Every valid telegram carries both fields with the same
+/// Pairs up `import_kind`/`export_kind` rows sharing the same timestamp into
+/// a signed, timestamp-ordered net series (positive = import, negative =
+/// export). Used for net power (P-import/P-export) and, identically, for
+/// net electricity-meter consumption per tariff (E-import-T1/E-export-T1,
+/// and T2) -- import and export are mutually exclusive at any instant, so
+/// netting them the same way makes sense regardless of which pair it is.
+/// Every valid telegram carries both fields of a pair with the same
 /// timestamp, so a value on one side with nothing on the other is
 /// unexpected.
-pub fn net_power_series_sorted(conn: &Connection) -> rusqlite::Result<Vec<(i64, i64)>> {
-    let imports = read_series_sorted(conn, "P-import")?;
+///
+/// `quiet` suppresses the anomaly warnings below without changing what gets
+/// computed -- see `write_day`'s doc comment for why: today's still-growing
+/// file gets recomputed hourly, so every anomaly in it (real or just a
+/// symptom of the day being incomplete) would otherwise get logged again
+/// and again, all day, for the exact same underlying cause.
+fn net_series_sorted(
+    conn: &Connection,
+    import_kind: &str,
+    export_kind: &str,
+    quiet: bool,
+) -> rusqlite::Result<Vec<(i64, i64)>> {
+    let imports = read_series_sorted(conn, import_kind)?;
     // For exports: convert vec to hashmap for O(1) lookup:
-    let mut exports: HashMap<i64, i64> = read_series_sorted(conn, "P-export")?.into_iter().collect();
+    let mut exports: HashMap<i64, i64> = read_series_sorted(conn, export_kind)?.into_iter().collect();
 
     let mut net = Vec::with_capacity(imports.len());
     for (timestamp, import) in imports {
         match exports.remove(&timestamp) {
             Some(export) => net.push((timestamp, import - export)),
-            None => log::warn!("P-import at {timestamp} has no matching P-export; skipped from power aggregates"),
+            None if quiet => {}
+            None => log::warn!("{import_kind} at {timestamp} has no matching {export_kind}; skipped from net aggregates"),
         }
     }
-    for orphan_timestamp in exports.into_keys() {
-        log::warn!("P-export at {orphan_timestamp} has no matching P-import; skipped from power aggregates");
+    if !quiet {
+        for orphan_timestamp in exports.into_keys() {
+            log::warn!("{export_kind} at {orphan_timestamp} has no matching {import_kind}; skipped from net aggregates");
+        }
     }
     if !net.is_sorted_by_key(|(timestamp, _)| *timestamp) {
-        log::warn!(
-            "net power series wasn't sorted by timestamp as expected; \
-             bucket_power() streams its input assuming ascending order, \
-             so sorting now to avoid silently wrong buckets"
-        );
+        if !quiet {
+            log::warn!(
+                "net {import_kind}/{export_kind} series wasn't sorted by timestamp as expected; \
+                 downstream bucketing assumes ascending order, so sorting now to avoid silently wrong buckets"
+            );
+        }
         net.sort_unstable_by_key(|(timestamp, _)| *timestamp);
     }
     Ok(net)
@@ -135,43 +152,31 @@ fn last_value_per_hour(series: Vec<(i64, i64)>) -> HashMap<i64, i64> {
     last
 }
 
-fn electricity_meter_buckets(conn: &Connection) -> rusqlite::Result<Vec<ElectricityMeterBucket>> {
-    let import_t1 = last_value_per_hour(read_series_sorted(conn, "E-import-T1")?);
-    let import_t2 = last_value_per_hour(read_series_sorted(conn, "E-import-T2")?);
-    let export_t1 = last_value_per_hour(read_series_sorted(conn, "E-export-T1")?);
-    let export_t2 = last_value_per_hour(read_series_sorted(conn, "E-export-T2")?);
+fn electricity_meter_buckets(conn: &Connection, quiet: bool) -> rusqlite::Result<Vec<ElectricityMeterBucket>> {
+    let net_t1 = last_value_per_hour(net_series_sorted(conn, "E-import-T1", "E-export-T1", quiet)?);
+    let net_t2 = last_value_per_hour(net_series_sorted(conn, "E-import-T2", "E-export-T2", quiet)?);
 
-    // Union of the import/export-t1/t2 keys. These four normally share the same
-    // hours (one telegram writes all four at once), but a telegram that
-    // reports one of them blank while the others are populated (see the
-    // parser's "skip a line if its value is empty" handling) would desync
-    // them for that hour -- so every hour that appears in *any* of the four
-    // needs to be considered, not just whichever one happened to be picked
-    // as the reference. Warns if one is missing.
-    let mut hours: Vec<i64> =
-        import_t1.keys().chain(import_t2.keys()).chain(export_t1.keys()).chain(export_t2.keys()).copied().collect();
+    // Union of both hour-sets: T1 and T2 normally cover the same hours (one
+    // telegram contributes to both every time), but an hour where every
+    // reading on one side failed to pair (see `net_series_sorted`) would
+    // leave that hour missing from just one of the two maps -- so every hour
+    // that appears in *either* needs to be considered, not just one's own.
+    let mut hours: Vec<i64> = net_t1.keys().chain(net_t2.keys()).copied().collect();
     hours.sort_unstable();
     hours.dedup();
 
     Ok(hours
         .into_iter()
-        .filter_map(|bucket_start| {
-            match (
-                import_t1.get(&bucket_start),
-                import_t2.get(&bucket_start),
-                export_t1.get(&bucket_start),
-                export_t2.get(&bucket_start),
-            ) {
-                (Some(&import_t1_wh), Some(&import_t2_wh), Some(&export_t1_wh), Some(&export_t2_wh)) => {
-                    Some(ElectricityMeterBucket { bucket_start, import_t1_wh, import_t2_wh, export_t1_wh, export_t2_wh })
-                }
-                _ => {
+        .filter_map(|bucket_start| match (net_t1.get(&bucket_start), net_t2.get(&bucket_start)) {
+            (Some(&net_t1_wh), Some(&net_t2_wh)) => Some(ElectricityMeterBucket { bucket_start, net_t1_wh, net_t2_wh }),
+            _ => {
+                if !quiet {
                     log::warn!(
-                        "hour {bucket_start} is missing one or more of E-import-T1/T2, E-export-T1/T2; \
+                        "hour {bucket_start} is missing net T1 or net T2 electricity consumption; \
                          skipped from meter_electricity aggregates"
                     );
-                    None
                 }
+                None
             }
         })
         .collect())
@@ -186,13 +191,16 @@ fn gas_meter_buckets(conn: &Connection) -> rusqlite::Result<Vec<GasMeterBucket>>
         .collect())
 }
 
-/// Computes every aggregate for one raw day-file's connection.
-pub fn compute_day(conn: &Connection) -> rusqlite::Result<DayAggregate> {
-    let net = net_power_series_sorted(conn)?;
+/// Computes every aggregate for one raw day-file's connection. `quiet`: see
+/// `write_day`'s doc comment -- pass `true` while a day is still "today"
+/// (recomputed hourly, so its own anomalies would otherwise repeat all day),
+/// `false` for its one-time, final computation right before archiving.
+pub fn compute_day(conn: &Connection, quiet: bool) -> rusqlite::Result<DayAggregate> {
+    let net = net_series_sorted(conn, "P-import", "P-export", quiet)?;
     Ok(DayAggregate {
         power_1min: bucket_power(&net, SECONDS_PER_MINUTE),
         power_1day: bucket_power(&net, SECONDS_PER_DAY),
-        meter_electricity: electricity_meter_buckets(conn)?,
+        meter_electricity: electricity_meter_buckets(conn, quiet)?,
         meter_gas: gas_meter_buckets(conn)?,
     })
 }
@@ -216,10 +224,8 @@ pub fn open_aggregates_db(path: &Path) -> rusqlite::Result<Connection> {
         );
         CREATE TABLE IF NOT EXISTS meter_electricity (
             bucket_start INTEGER NOT NULL PRIMARY KEY,
-            import_t1_wh INTEGER NOT NULL,
-            import_t2_wh INTEGER NOT NULL,
-            export_t1_wh INTEGER NOT NULL,
-            export_t2_wh INTEGER NOT NULL
+            net_t1_wh INTEGER NOT NULL,
+            net_t2_wh INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS meter_gas (
             bucket_start INTEGER NOT NULL PRIMARY KEY,
@@ -275,11 +281,23 @@ const GAS_BOUNDARY_TOLERANCE_SECONDS: i64 = SECONDS_PER_HOUR / 2;
 /// the telegram's by up to `GAS_BOUNDARY_TOLERANCE_SECONDS`, so that much
 /// drift is dropped silently, and only anything further out (a real
 /// anomaly) gets logged.
+///
+/// `quiet` suppresses all of the above warnings (not the dropping itself,
+/// which always happens regardless): a day that's still "today" gets
+/// recomputed and rewritten every hour by the cron job, so anything
+/// anomalous in it -- real or just a symptom of the day being incomplete --
+/// would otherwise get logged again on every single one of those hourly
+/// runs, all pointing at the exact same underlying cause. Pass `true` while
+/// `day_start >= today_start`, `false` for a day's one-time, final write
+/// right before it gets archived -- that way every real anomaly still
+/// surfaces exactly once, on the run where it actually matters, instead of
+/// up to ~24 times or not at all.
 pub fn write_day(
     aggregates_conn: &mut Connection,
     day_start: i64,
     day_end: i64,
     data: &DayAggregate,
+    quiet: bool,
 ) -> rusqlite::Result<()> {
     let tx = aggregates_conn.transaction()?;
     {
@@ -292,7 +310,9 @@ pub fn write_day(
             tx.prepare_cached("INSERT INTO power_1min (bucket_start, min_w, avg_w, max_w) VALUES (?1, ?2, ?3, ?4)")?;
         for bucket in &data.power_1min {
             if !in_day_range(bucket.bucket_start, day_start, day_end) {
-                log::warn!("power_1min bucket {} outside [{day_start}, {day_end}); dropped", bucket.bucket_start);
+                if !quiet {
+                    log::warn!("power_1min bucket {} outside [{day_start}, {day_end}); dropped", bucket.bucket_start);
+                }
                 continue;
             }
             power_1min_stmt.execute((bucket.bucket_start, bucket.min_w, bucket.avg_w, bucket.max_w))?;
@@ -303,7 +323,9 @@ pub fn write_day(
             tx.prepare_cached("INSERT INTO power_1day (bucket_start, min_w, avg_w, max_w) VALUES (?1, ?2, ?3, ?4)")?;
         for bucket in &data.power_1day {
             if !in_day_range(bucket.bucket_start, day_start, day_end) {
-                log::warn!("power_1day bucket {} outside [{day_start}, {day_end}); dropped", bucket.bucket_start);
+                if !quiet {
+                    log::warn!("power_1day bucket {} outside [{day_start}, {day_end}); dropped", bucket.bucket_start);
+                }
                 continue;
             }
             power_1day_stmt.execute((bucket.bucket_start, bucket.min_w, bucket.avg_w, bucket.max_w))?;
@@ -311,21 +333,16 @@ pub fn write_day(
         drop(power_1day_stmt);
 
         let mut electricity_stmt = tx.prepare_cached(
-            "INSERT INTO meter_electricity (bucket_start, import_t1_wh, import_t2_wh, export_t1_wh, export_t2_wh)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO meter_electricity (bucket_start, net_t1_wh, net_t2_wh) VALUES (?1, ?2, ?3)",
         )?;
         for bucket in &data.meter_electricity {
             if !in_day_range(bucket.bucket_start, day_start, day_end) {
-                log::warn!("meter_electricity bucket {} outside [{day_start}, {day_end}); dropped", bucket.bucket_start);
+                if !quiet {
+                    log::warn!("meter_electricity bucket {} outside [{day_start}, {day_end}); dropped", bucket.bucket_start);
+                }
                 continue;
             }
-            electricity_stmt.execute((
-                bucket.bucket_start,
-                bucket.import_t1_wh,
-                bucket.import_t2_wh,
-                bucket.export_t1_wh,
-                bucket.export_t2_wh,
-            ))?;
+            electricity_stmt.execute((bucket.bucket_start, bucket.net_t1_wh, bucket.net_t2_wh))?;
         }
         drop(electricity_stmt);
 
@@ -333,7 +350,7 @@ pub fn write_day(
         for bucket in &data.meter_gas {
             if !in_day_range(bucket.bucket_start, day_start, day_end) {
                 let distance = distance_outside_range(bucket.bucket_start, day_start, day_end);
-                if distance > GAS_BOUNDARY_TOLERANCE_SECONDS {
+                if distance > GAS_BOUNDARY_TOLERANCE_SECONDS && !quiet {
                     log::warn!(
                         "meter_gas bucket {} outside [{day_start}, {day_end}) by {distance}s -- \
                          further than the expected M-Bus lag near a day boundary; dropped",
@@ -423,8 +440,8 @@ mod tests {
             meter_gas: vec![],
         };
 
-        write_day(&mut conn, 0, SECONDS_PER_DAY, &data).unwrap();
-        write_day(&mut conn, 0, SECONDS_PER_DAY, &data).unwrap();
+        write_day(&mut conn, 0, SECONDS_PER_DAY, &data, false).unwrap();
+        write_day(&mut conn, 0, SECONDS_PER_DAY, &data, false).unwrap();
 
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM power_1min", [], |row| row.get(0)).unwrap();
         assert_eq!(count, 1, "rerunning must not duplicate rows");
@@ -454,7 +471,7 @@ mod tests {
                 GasMeterBucket { bucket_start: SECONDS_PER_DAY, import_dm3: 999 }, // stray, belongs to day 1
             ],
         };
-        write_day(&mut conn, 0, SECONDS_PER_DAY, &day0).unwrap();
+        write_day(&mut conn, 0, SECONDS_PER_DAY, &day0, false).unwrap();
 
         // Day 1's own, correct, in-range value for that same bucket_start.
         let day1 = DayAggregate {
@@ -463,7 +480,7 @@ mod tests {
             meter_electricity: vec![],
             meter_gas: vec![GasMeterBucket { bucket_start: SECONDS_PER_DAY, import_dm3: 200 }],
         };
-        write_day(&mut conn, SECONDS_PER_DAY, 2 * SECONDS_PER_DAY, &day1).unwrap();
+        write_day(&mut conn, SECONDS_PER_DAY, 2 * SECONDS_PER_DAY, &day1, false).unwrap();
 
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM meter_gas", [], |row| row.get(0)).unwrap();
         assert_eq!(count, 2, "one row per real day, stray boundary bucket must not add a third");
@@ -510,7 +527,7 @@ mod tests {
                 GasMeterBucket { bucket_start: 10 * SECONDS_PER_DAY, import_dm3: 999 },
             ],
         };
-        write_day(&mut conn, 0, SECONDS_PER_DAY, &data).unwrap();
+        write_day(&mut conn, 0, SECONDS_PER_DAY, &data, false).unwrap();
 
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM meter_gas", [], |row| row.get(0)).unwrap();
         assert_eq!(count, 1, "the far-out-of-range bucket must still be dropped, not inserted");
@@ -520,36 +537,78 @@ mod tests {
     }
 
     #[test]
-    fn electricity_meter_buckets_skips_an_hour_missing_one_of_the_four_fields_but_keeps_others() {
+    fn electricity_meter_buckets_nets_import_minus_export_per_tariff() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE readings (type TEXT NOT NULL, timestamp INTEGER NOT NULL, value INTEGER NOT NULL);")
             .unwrap();
-
         let insert = |kind: &str, timestamp: i64, value: i64| {
             conn.execute("INSERT INTO readings (type, timestamp, value) VALUES (?1, ?2, ?3)", (kind, timestamp, value))
                 .unwrap();
         };
 
-        // Hour 0: all four fields present -- should produce a bucket.
         insert("E-import-T1", 0, 100);
-        insert("E-import-T2", 0, 200);
         insert("E-export-T1", 0, 10);
+        insert("E-import-T2", 0, 200);
         insert("E-export-T2", 0, 20);
 
-        // Hour SECONDS_PER_HOUR: E-export-T2 is missing entirely for this
-        // hour (simulates a telegram reporting it blank) -- must be skipped
-        // rather than silently producing a bucket with a wrong/default value.
-        insert("E-import-T1", SECONDS_PER_HOUR, 101);
-        insert("E-import-T2", SECONDS_PER_HOUR, 201);
-        insert("E-export-T1", SECONDS_PER_HOUR, 11);
+        let buckets = electricity_meter_buckets(&conn, false).unwrap();
 
-        let buckets = electricity_meter_buckets(&conn).unwrap();
-
-        assert_eq!(buckets.len(), 1, "the incomplete hour must be skipped, not included");
+        assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0].bucket_start, 0);
-        assert_eq!(buckets[0].import_t1_wh, 100);
-        assert_eq!(buckets[0].import_t2_wh, 200);
-        assert_eq!(buckets[0].export_t1_wh, 10);
-        assert_eq!(buckets[0].export_t2_wh, 20);
+        assert_eq!(buckets[0].net_t1_wh, 90, "100 import - 10 export");
+        assert_eq!(buckets[0].net_t2_wh, 180, "200 import - 20 export");
+    }
+
+    #[test]
+    fn electricity_meter_buckets_skips_an_hour_where_one_tariff_has_no_net_value() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE readings (type TEXT NOT NULL, timestamp INTEGER NOT NULL, value INTEGER NOT NULL);")
+            .unwrap();
+        let insert = |kind: &str, timestamp: i64, value: i64| {
+            conn.execute("INSERT INTO readings (type, timestamp, value) VALUES (?1, ?2, ?3)", (kind, timestamp, value))
+                .unwrap();
+        };
+
+        // Hour 0: both tariffs pair up fully -- should produce a bucket.
+        insert("E-import-T1", 0, 100);
+        insert("E-export-T1", 0, 10);
+        insert("E-import-T2", 0, 200);
+        insert("E-export-T2", 0, 20);
+
+        // Hour SECONDS_PER_HOUR: T1 pairs fine, but E-export-T2 is missing
+        // entirely for this hour, so net_series_sorted can't pair *any*
+        // T2 reading here -- net_t2 ends up with no entry for this hour at
+        // all, so the whole hour must be skipped, not just T2's half of it.
+        insert("E-import-T1", SECONDS_PER_HOUR, 101);
+        insert("E-export-T1", SECONDS_PER_HOUR, 11);
+        insert("E-import-T2", SECONDS_PER_HOUR, 201);
+
+        let buckets = electricity_meter_buckets(&conn, false).unwrap();
+
+        assert_eq!(buckets.len(), 1, "the hour missing a net T2 value must be skipped");
+        assert_eq!(buckets[0].bucket_start, 0);
+    }
+
+    #[test]
+    fn quiet_only_suppresses_logging_never_changes_the_computed_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE readings (type TEXT NOT NULL, timestamp INTEGER NOT NULL, value INTEGER NOT NULL);")
+            .unwrap();
+        let insert = |kind: &str, timestamp: i64, value: i64| {
+            conn.execute("INSERT INTO readings (type, timestamp, value) VALUES (?1, ?2, ?3)", (kind, timestamp, value))
+                .unwrap();
+        };
+
+        // A P-import with no matching P-export -- the exact anomaly whose
+        // *logging* quiet is meant to suppress. The resulting net series
+        // must be identical either way; only whether it warns should differ.
+        insert("P-import", 0, 100);
+        insert("P-export", 0, 0);
+        insert("P-import", 60, 200); // orphan: no matching P-export at 60
+
+        let loud = net_series_sorted(&conn, "P-import", "P-export", false).unwrap();
+        let quiet = net_series_sorted(&conn, "P-import", "P-export", true).unwrap();
+        assert_eq!(loud, quiet);
+        assert_eq!(loud, vec![(0, 100)], "the orphaned P-import must still be skipped, quiet or not");
     }
 }

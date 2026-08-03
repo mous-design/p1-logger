@@ -72,6 +72,12 @@ fn prune_old_archives(processed_dir: &Path, cutoff_start: i64) {
 /// Computes and writes one day's aggregates, then archives the raw file
 /// unless it's still today's (still being written by the logger). Returns
 /// whether it was archived.
+///
+/// Today's file gets recomputed and rewritten every hour, so its anomaly
+/// warnings are suppressed (`quiet`) until the one run where it's no longer
+/// today -- that final, pre-archive computation is the only one where every
+/// real anomaly gets logged, exactly once. See `aggregate::write_day`'s doc
+/// comment for the full reasoning.
 fn process_day(
     aggregates_conn: &mut Connection,
     processed_dir: &Path,
@@ -79,13 +85,15 @@ fn process_day(
     day_start: i64,
     path: &Path,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    let is_today = day_start >= today_start;
+
     let raw_conn = Connection::open(path)?;
-    let data = aggregate::compute_day(&raw_conn)?;
+    let data = aggregate::compute_day(&raw_conn, is_today)?;
     drop(raw_conn);
 
-    aggregate::write_day(aggregates_conn, day_start, day_start + SECONDS_PER_DAY, &data)?;
+    aggregate::write_day(aggregates_conn, day_start, day_start + SECONDS_PER_DAY, &data, is_today)?;
 
-    if day_start >= today_start {
+    if is_today {
         return Ok(false);
     }
     let file_name = path.file_name().ok_or("day-file path has no filename")?;
