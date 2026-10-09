@@ -1,5 +1,9 @@
 /target
 /data
+/frontend/node_modules
+/frontend/dist
+/frontend/public/fonts/
 .DS_Store
 .env
+.claude
 CLAUDE.md

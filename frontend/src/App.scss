@@ -1,0 +1,596 @@
+// General Sans (Fontshare, SIL OFL) -- self-hosted under public/fonts so the
+// deploy stays fully self-contained (no runtime CDN dependency, consistent
+// with the "one binary, one scp" story: this Pi may not always have
+// internet). Only the four weights actually used in the app.
+@font-face {
+  font-family: "General Sans";
+  src: url("/fonts/GeneralSans-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-display: swap;
+  font-style: normal;
+}
+@font-face {
+  font-family: "General Sans";
+  src: url("/fonts/GeneralSans-Medium.woff2") format("woff2");
+  font-weight: 500;
+  font-display: swap;
+  font-style: normal;
+}
+@font-face {
+  font-family: "General Sans";
+  src: url("/fonts/GeneralSans-Semibold.woff2") format("woff2");
+  font-weight: 600;
+  font-display: swap;
+  font-style: normal;
+}
+@font-face {
+  font-family: "General Sans";
+  src: url("/fonts/GeneralSans-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-display: swap;
+  font-style: normal;
+}
+
+// Design tokens -- see the "p1-web visuele richting" design-review artifact
+// for the reasoning behind each value. Light-mode only for now (index.scss's
+// `color-scheme: light dark` is just a UA hint for form controls/scrollbars,
+// not a commitment to a dark palette yet) -- these are plain custom
+// properties so a dark set can be added later without touching every rule
+// that consumes them.
+:root {
+  --bg: #f6f7f8;
+  --surface: #ffffff;
+  --border: #e4e5e7;
+  --border-strong: #d4d5d8;
+  --text: #222327;
+  --text-muted: #6b6f76;
+  --text-faint: #9a9da3;
+
+  --import: #dd7d2e;
+  --export: #4f9e8c;
+
+  --shadow-card: 0 1px 2px rgba(20, 20, 22, 0.05), 0 4px 14px rgba(20, 20, 22, 0.05);
+  --shadow-header: 0 1px 0 rgba(20, 20, 22, 0.06), 0 6px 16px rgba(20, 20, 22, 0.04);
+
+  --radius-card: 10px;
+  --radius-control: 6px;
+
+  --scrollbar-thickness: 8px;
+
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-base: 15px;
+  --fs-md: 17px;
+  --fs-lg: 21px;
+  --fs-xl: 24px;
+
+  --font-ui: "General Sans", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+#root {
+  min-height: 100vh;
+  font-family: var(--font-ui);
+  background: var(--bg);
+  color: var(--text);
+}
+
+// Digits that line up in a column (kWh values, axis ticks) read better
+// monospaced-width -- applies broadly rather than per-component since it
+// never hurts non-numeric text.
+.overview-stat dd,
+.net-total,
+.recharts-text {
+  font-variant-numeric: tabular-nums;
+}
+
+// Solid and darker than the dashed CartesianGrid, so the import/export
+// boundary reads as a baseline rather than as just another grid line. Set
+// here rather than via ReferenceLine's `stroke` prop: that lands in an SVG
+// presentation attribute, where a var() token isn't reliably resolved.
+.zero-line .recharts-reference-line-line {
+  stroke: var(--text-muted);
+  stroke-width: 1;
+}
+
+// Only the single-chart detail view gets a readable max-width -- the
+// dashboard grid needs the full viewport to fit multiple 300px tiles per
+// row, so that constraint moved off #root itself. Its own padding replaces
+// what used to come from #root, now that #root itself has none (the
+// dashboard header/grid own their padding instead, see below).
+.detail-view {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: var(--sp-8);
+}
+
+.back-button {
+  display: block;
+  border: none;
+  background: none;
+  padding: 0;
+  margin-bottom: var(--sp-4);
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: var(--fs-base);
+}
+
+.dashboard-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--sp-6);
+  padding: 4px var(--sp-8);
+  background: var(--bg);
+  box-shadow: var(--shadow-header);
+
+  h1 {
+    font-size: var(--fs-xl);
+    font-weight: 600;
+    margin: 0;
+  }
+}
+
+.dashboard-header-menu {
+  position: relative;
+}
+
+.cog-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: none;
+  padding: var(--sp-1);
+  cursor: pointer;
+  color: var(--text-muted);
+
+  &:hover {
+    color: var(--text);
+  }
+}
+
+// Stacking order, lowest first. Chart overlays (scrollbar, zoom icons) only
+// need to clear the chart's own SVG; popup menus must clear those overlays
+// too -- none of the ancestors create their own stacking context, so the
+// two compare directly.
+$z-chart-overlay: 20;
+$z-popup: 30;
+
+.widget-toggle-menu {
+  position: absolute;
+  right: 0;
+  top: 100%;
+  margin-top: var(--sp-2);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  padding: var(--sp-2) var(--sp-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  box-shadow: var(--shadow-card);
+  z-index: $z-popup;
+
+  // The period popup's options are plain <button>s (not the cog menu's
+  // checkboxes) -- reskinned to match the rest of the refined controls
+  // instead of raw OS button chrome.
+  button {
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-control);
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+    font-size: var(--fs-sm);
+    padding: 6px var(--sp-3);
+    cursor: pointer;
+
+    &:disabled {
+      color: var(--text-faint);
+      cursor: default;
+    }
+  }
+}
+
+.menu-section-title {
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: var(--sp-1);
+}
+
+.widget-toggle-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.period-selector {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: center;
+
+  button {
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-control);
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+    font-size: var(--fs-sm);
+    padding: 6px var(--sp-3);
+    cursor: pointer;
+
+    &:disabled {
+      color: var(--text-faint);
+      cursor: default;
+    }
+  }
+}
+
+.period-current-button {
+  min-width: 90px;
+}
+
+// Positions its popup (reuses .widget-toggle-menu -- same visual style as
+// the dashboard's cog menu); the trigger button reuses the same reskinned
+// button look as "Vandaag" so it reads as part of the same control group.
+.period-type-menu {
+  position: relative;
+
+  > button {
+    min-width: 50px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-control);
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+    font-size: var(--fs-sm);
+    padding: 6px var(--sp-3);
+    cursor: pointer;
+  }
+}
+
+// Card styling matches .widget-tile's (same border/radius/shadow), but
+// sized to the full detail-view content instead of a fixed dashboard-tile
+// size -- header and body own their own padding instead of one shared value,
+// since the header additionally needs its bottom border to span edge-to-edge.
+.detail-tile {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+}
+
+.detail-tile-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--sp-4) var(--sp-6);
+  border-bottom: 1px solid var(--border);
+}
+
+// The title moved up into the header, next to the period controls, instead
+// of standing alone above the chart at full headline size -- one step down
+// from the dashboard's own h1 (--fs-xl) rather than matching it.
+.detail-title {
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  margin: 0;
+}
+
+.detail-tile-header-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+
+.detail-tile-body {
+  padding: var(--sp-6);
+  font-size: var(--fs-md);
+}
+
+// Kills the "first element inside a tile carries a stray top margin"
+// problem generically (e.g. <p>'s default UA margin) -- applies at every
+// nesting depth, not just direct children, so a wrapper <div> around the
+// actual first element (like each chart component's own root) doesn't
+// defeat it. One rule instead of zeroing margin-top by hand on every new
+// first element that shows up inside a tile.
+.widget-tile *:first-child,
+.detail-tile-body *:first-child {
+  margin-top: 0;
+}
+
+// Recharts puts tabIndex on the SVG surface (and on the Brush's traveller
+// handles) for keyboard accessibility, which is what draws the browser's
+// default focus ring on click -- suppress just the outline, not the
+// underlying focusability.
+.recharts-wrapper :focus,
+.recharts-surface:focus {
+  outline: none;
+}
+
+// Plot-rect constants -- the pixel box the Lines/Grid actually occupy
+// inside the SVG, excluding the y-axis label column and x-axis tick row.
+// Verified against the rendered SVG's own y-axis line (x1=92, y1=5,
+// y2=325) rather than guessed: left = CHART_MARGIN.left(10) +
+// Y_AXIS_WIDTH(82); top = CHART_MARGIN.top(5); bottom = chart height(360)
+// - CHART_MARGIN.bottom(5) - XAxis height(30, now pinned via X_AXIS_HEIGHT
+// in chart/zoom.tsx instead of left to Recharts' auto layout, so this
+// can't silently drift). Both scrollbars are positioned against this rect
+// directly, not against the padded SVG canvas around it -- "de breedte/
+// hoogte van de grafiek zelf", not the chart including its axis labels.
+$plot-left: 92px;
+$plot-top: 5px;
+$plot-bottom: 325px;
+$icon-row-height: 18px;
+$row-gap: 4px;
+
+// Right side -- the vertical scrollbar sits a few px right of the plot,
+// its own zoom-icon column stacks in the bottom-right corner separately
+// (not sharing the scrollbar's vertical span). $plot-right-inset must
+// match CHART_MARGIN.right in chart/zoom.tsx exactly, since that's what
+// actually carves this space out of the SVG. The +12px is extra breathing
+// room between the plot and the scrollbar specifically (the scrollbar's
+// own `right` offset is already about as small as it can go, so the plot
+// gives up the width instead).
+$vgap: 5px;
+$vzoom-col-width: 18px;
+$plot-right-inset: $vgap + 8px + $vgap + $vzoom-col-width + 12px;
+
+.chart-area {
+  position: relative;
+  height: 360px + $row-gap + $icon-row-height;
+}
+
+.chart-area-plot {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 360px;
+  min-width: 0;
+}
+
+.dashboard-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-6);
+  padding: 0 var(--sp-8) var(--sp-8) var(--sp-8);
+}
+
+.widget-tile {
+  width: 300px;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  padding: var(--sp-4);
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+}
+
+.widget-tile-title {
+  font-weight: 600;
+  margin-bottom: var(--sp-2);
+}
+
+.widget-tile-status {
+  color: var(--text-muted);
+}
+
+.overview-widget {
+  cursor: default;
+}
+
+.overview-stats {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  flex: 1;
+  margin: 0;
+  padding-top: var(--sp-2);
+}
+
+.overview-stat {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: var(--fs-sm);
+
+  dt {
+    color: var(--text-muted);
+  }
+
+  dd {
+    margin: 0;
+    font-size: var(--fs-base);
+    font-weight: 600;
+  }
+}
+
+.net-total {
+  font-weight: 600;
+}
+
+.series-toggle-row {
+  display: flex;
+  gap: var(--sp-4);
+  margin: var(--sp-2) 0;
+}
+
+.series-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  border: none;
+  background: none;
+  padding: 0;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+
+.series-toggle-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+// Its own row below the plot, left-aligned under the y-axis label column
+// -- a normal flow position (not layered on top of the chart), so it's
+// never at risk of sitting behind the SVG in paint order the way an
+// earlier absolutely-positioned-over-the-chart version did. Drives the
+// x-axis only (see useAxisZoom's split zoomInX/zoomInY etc.) -- a
+// combined zoom button tested poorly, see its own doc comment.
+.zoom-icon-gutter-horizontal {
+  position: absolute;
+  left: 0;
+  top: 364px + $row-gap;
+  width: $plot-left;
+  height: $icon-row-height;
+  display: flex;
+  align-items: center;
+  justify-content: end;
+  padding-right: 5px;
+}
+
+// Bottom-right corner, stacked (not the horizontal gutter's row) -- drives
+// the y-axis only.
+.zoom-icon-gutter-vertical {
+  position: absolute;
+  right: 0;
+  top: 328px + $row-gap;
+  width: $vzoom-col-width;
+  display: flex;
+  flex-direction: column;
+  z-index: $z-chart-overlay;
+}
+
+.zoom-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+
+  &:hover:not(:disabled) {
+    color: var(--text);
+  }
+
+  &:disabled {
+    color: var(--border);
+    cursor: default;
+  }
+}
+
+// Sits beside the icon row, spanning exactly the plot's own width (not
+// the full chart canvas). The +2px nudges it to visually align with the
+// icon row's own reset button -- centering purely on the row's box
+// (icon-row-height/2) landed 2px off from where the button's own icon
+// glyph actually reads as centered.
+.axis-scrollbar-horizontal {
+  position: absolute;
+  left: $plot-left;
+  right: $plot-right-inset;
+  top: calc(360px + #{$row-gap} + (#{$icon-row-height} - 8px) / 2 + 2px);
+}
+
+// Spans exactly the plot's own height (not the full chart canvas
+// including the x-axis tick row).
+.axis-scrollbar-vertical {
+  position: absolute;
+  top: $plot-top;
+  height: $plot-bottom - $plot-top;
+  right: 6px;
+  z-index: $z-chart-overlay;
+}
+
+// A macOS-scrollbar-style track + pill thumb, with the resize handles
+// invisible until hovered -- same look the Recharts Brush had, now driving
+// a continuous value range on either axis instead of Recharts' own
+// index-based Brush (see AxisScrollbar.tsx). No position here -- the
+// orientation-specific rules above already set position:absolute, which
+// is itself a positioning context for the thumb's own position:absolute,
+// so a redundant position here would only risk overriding theirs by
+// cascade order (as it did once already).
+.axis-scrollbar {
+  background: #e2e2e2;
+  border-radius: 9px;
+  user-select: none;
+  touch-action: none;
+}
+
+.axis-scrollbar-horizontal {
+  height: var(--scrollbar-thickness);
+}
+
+.axis-scrollbar-vertical {
+  width: var(--scrollbar-thickness);
+}
+
+.axis-scrollbar-thumb {
+  position: absolute;
+  background: #9a9a9a;
+  border-radius: 9px;
+  cursor: grab;
+
+  &:active {
+    cursor: grabbing;
+  }
+}
+
+.axis-scrollbar-horizontal .axis-scrollbar-thumb {
+  top: 0;
+  height: 100%;
+}
+
+.axis-scrollbar-vertical .axis-scrollbar-thumb {
+  left: 0;
+  width: 100%;
+}
+
+// Invisible hit areas at the thumb's two edges -- the cursor switching to
+// col-resize/row-resize on hover is cue enough, matching the Brush
+// traveller's own previous behavior.
+.axis-scrollbar-handle {
+  position: absolute;
+}
+
+.axis-scrollbar-horizontal .axis-scrollbar-handle {
+  top: 0;
+  width: 8px;
+  height: 100%;
+  cursor: col-resize;
+}
+
+.axis-scrollbar-vertical .axis-scrollbar-handle {
+  left: 0;
+  height: 8px;
+  width: 100%;
+  cursor: row-resize;
+}

@@ -22,22 +22,58 @@ usage() {
     cat <<EOF
 Usage:
   ./run <file>          Run p1-logger against <file> (device path or plain file)
+  ./run build-frontend  fetch the dashboard fonts if missing, then npm install +
+                        build the p1-web dashboard (frontend/dist)
   ./run build-dev       cargo build (debug, native)
   ./run build-release   cargo build --release (native)
-  ./run build-pi        cross-compile release build for the Pi ($PI_TARGET)
-  ./run deploy          build-pi, then scp both binaries + the systemd unit
-                        + the cron.d template to $PI_HOST
+  ./run build-pi        build-frontend, then cross-compile release build for
+                        the Pi ($PI_TARGET) -- p1-web embeds frontend/dist at
+                        compile time, so it must exist first
+  ./run deploy          build-pi, then scp all three binaries + the systemd
+                        units (p1-logger, p1-web) + the cron.d template to $PI_HOST
   ./run view-log <type> [-f]
                         Show recent logs from $PI_HOST via journalctl.
-                        <type> is one of: p1-logger, p1-aggregate
+                        <type> is one of: p1-logger, p1-web, p1-aggregate
                         -f follows (like tail -f), Ctrl-C to stop.
   ./run help            Show this usage
 EOF
 }
 
+# General Sans may be used freely (ITF Free Font License), but not
+# redistributed -- so the .woff2 files stay out of the repo, and a build
+# fetches them straight from Fontshare instead, only when any is missing.
+# The weights must match the @font-face rules in frontend/src/App.scss.
+FONT_DIR="frontend/public/fonts"
+FONT_WEIGHTS="Regular Medium Semibold Bold"
+fetch_fonts() {
+    local weight missing=
+    for weight in $FONT_WEIGHTS; do
+        [ -f "$FONT_DIR/GeneralSans-$weight.woff2" ] || missing=1
+    done
+    if [ -z "$missing" ]; then
+        return
+    fi
+    echo "Fetching General Sans from Fontshare..."
+    local tmp
+    tmp="$(mktemp -d)"
+    curl -sSfL -o "$tmp/general-sans.zip" "https://api.fontshare.com/v2/fonts/download/general-sans"
+    mkdir -p "$FONT_DIR"
+    # -j drops the zip's internal folders; a changed zip layout fails
+    # loudly here ("filename not matched") instead of silently building
+    # with fallback fonts.
+    for weight in $FONT_WEIGHTS; do
+        unzip -qjo "$tmp/general-sans.zip" "GeneralSans_Complete/Fonts/WEB/fonts/GeneralSans-$weight.woff2" -d "$FONT_DIR"
+    done
+    rm -rf "$tmp"
+}
+
 case "${1:-help}" in
     help | -h | --help)
         usage
+        ;;
+    build-frontend)
+        fetch_fonts
+        (cd frontend && npm install && npm run build)
         ;;
     build-dev)
         cargo build
@@ -46,6 +82,7 @@ case "${1:-help}" in
         cargo build --release
         ;;
     build-pi)
+        "$0" build-frontend
         cross build --release --target "$PI_TARGET"
         ;;
     deploy)
@@ -63,18 +100,20 @@ case "${1:-help}" in
         # aggregate run) fails with ETXTBSY. A rename only swaps the
         # directory entry, so anything mid-run (on the old inode) is
         # untouched.
-        for bin in p1-logger p1-aggregate; do
+        for bin in p1-web p1-logger p1-aggregate; do
             scp "target/$PI_TARGET/release/$bin" "$PI_HOST:/home/$PI_USER/bin/$bin.new"
             ssh "$PI_HOST" "mv /home/$PI_USER/bin/$bin.new /home/$PI_USER/bin/$bin"
         done
-        # systemd/p1-logger.service and cron.d/p1-aggregate are templates
-        # committed to the repo (placeholders, no username/paths); fill in
-        # the real user from .env only at deploy time, into throwaway
-        # rendered copies.
-        rendered_service="$(mktemp)"
-        sed "s|__PI_USER__|$PI_USER|g" systemd/p1-logger.service > "$rendered_service"
-        scp "$rendered_service" "$PI_HOST:/home/$PI_USER/p1-logger.service"
-        rm -f "$rendered_service"
+        # systemd/p1-{logger,web}.service and cron.d/p1-aggregate are
+        # templates committed to the repo (placeholders, no username/paths);
+        # fill in the real user from .env only at deploy time, into
+        # throwaway rendered copies.
+        for unit in p1-logger p1-web; do
+            rendered_service="$(mktemp)"
+            sed "s|__PI_USER__|$PI_USER|g" "systemd/$unit.service" > "$rendered_service"
+            scp "$rendered_service" "$PI_HOST:/home/$PI_USER/$unit.service"
+            rm -f "$rendered_service"
+        done
 
         # RETENTION_DAYS is optional -- unset means the cron line gets no
         # --retention-days flag at all, i.e. processed/ is never pruned.
@@ -88,14 +127,16 @@ case "${1:-help}" in
         rm -f "$rendered_cron"
         cat <<EOF
 
-Binaries + unit file + cron template deployed. One-time install on $PI_HOST (needs sudo):
+Binaries + unit files + cron template deployed. One-time install on $PI_HOST (needs sudo):
   sudo mv /home/$PI_USER/p1-logger.service /etc/systemd/system/p1-logger.service
+  sudo mv /home/$PI_USER/p1-web.service /etc/systemd/system/p1-web.service
   sudo systemctl daemon-reload
   sudo systemctl enable --now p1-logger
+  sudo systemctl enable --now p1-web
   sudo mv /home/$PI_USER/p1-aggregate.cron /etc/cron.d/p1-aggregate
   sudo chown root:root /etc/cron.d/p1-aggregate
   sudo chmod 644 /etc/cron.d/p1-aggregate
-After that, redeploys just need a: sudo systemctl restart p1-logger
+After that, redeploys just need: sudo systemctl restart p1-logger p1-web
 (cron picks up an updated p1-aggregate binary on its own next run, no reload needed)
 EOF
         ;;
@@ -111,21 +152,21 @@ EOF
         # -t allocates a pseudo-terminal: without it, Ctrl-C on a following
         # (-f) journalctl doesn't reliably reach the remote process.
         case "${2:-}" in
-            # p1-logger runs under systemd, so -u (unit) picks up everything
-            # associated with that service, including start/stop/restart
-            # events -- not just what it itself logged.
-            p1-logger)
-                ssh -t "$PI_HOST" "journalctl -u p1-logger -n 200 --no-pager $follow_flag"
+            # p1-logger/p1-web run under systemd, so -u (unit) picks up
+            # everything associated with that service, including
+            # start/stop/restart events -- not just what it itself logged.
+            p1-logger | p1-web)
+                ssh -t "$PI_HOST" "journalctl -u $2 -n 200 --no-pager $follow_flag"
                 ;;
             # p1-aggregate is a cron job, not a systemd unit, so there's no
-            # unit to filter by -- -t (syslog identifier) is what both
+            # unit to filter by -- -t (syslog identifier) is what all three
             # binaries are tagged with, set in logging::init_logging.
             p1-aggregate)
                 ssh -t "$PI_HOST" "journalctl -t p1-aggregate -n 200 --no-pager $follow_flag"
                 ;;
             *)
                 echo "error: unknown log type '${2:-}'" >&2
-                echo "usage: ./run view-log <p1-logger|p1-aggregate> [-f]" >&2
+                echo "usage: ./run view-log <p1-logger|p1-web|p1-aggregate> [-f]" >&2
                 exit 1
                 ;;
         esac

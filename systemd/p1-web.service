@@ -1,0 +1,14 @@
+[Unit]
+Description=P1 web dashboard
+After=local-fs.target
+
+[Service]
+Type=simple
+User=__PI_USER__
+WorkingDirectory=/home/__PI_USER__
+ExecStart=/home/__PI_USER__/bin/p1-web --data-dir /home/__PI_USER__/p1-data --bind 0.0.0.0:8080 -l -q
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
