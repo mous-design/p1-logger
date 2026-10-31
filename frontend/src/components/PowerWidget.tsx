@@ -1,6 +1,6 @@
 import { MiniChart } from "../chart/MiniChart";
 import { useTodaySeries } from "../hooks/useTodaySeries";
-import { formatKw, POWER_SERIES } from "./PowerChart";
+import { formatKw, POWER_SERIES, POWER_Y_DOMAIN } from "./PowerChart";
 import { WidgetTile } from "./WidgetTile";
 
 // Just avg, matching the detail view's own default-visible series -- a
@@ -12,7 +12,7 @@ export function PowerWidget({ onOpen }: { onOpen: () => void }) {
 
   return (
     <WidgetTile title="Vermogen" onOpen={onOpen} loading={loading} error={error}>
-      {data?.metric === "power" && <MiniChart points={data.points} series={WIDGET_SERIES} height={280} formatY={formatKw} zeroLine />}
+      {data?.metric === "power" && <MiniChart points={data.points} series={WIDGET_SERIES} height={280} formatY={formatKw} yDomain={POWER_Y_DOMAIN} />}
     </WidgetTile>
   );
 }

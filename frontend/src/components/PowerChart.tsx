@@ -4,7 +4,7 @@ import { computeTicks, computeValueTicks, formatTick, formatTooltipLabel } from 
 import { useAxisZoom } from "../chart/useAxisZoom";
 import { AXIS_TICK_FONT_SIZE, CHART_MARGIN, X_AXIS_HEIGHT, Y_AXIS_WIDTH } from "../chart/zoom";
 import { AxisScrollbar } from "../chart/AxisScrollbar";
-import { computeYDomain } from "../chart/range";
+import { computeYDomain, type YDomainOptions } from "../chart/range";
 import { ZoomIconGutter } from "../chart/ZoomIconGutter";
 import type { Period, PowerPoint } from "../types";
 import { formatMilli, tooltipFormatter } from "../chart/format";
@@ -39,6 +39,11 @@ export const POWER_SERIES = [
 
 const POWER_KEYS = POWER_SERIES.map((s) => s.dataKey);
 
+// Shared with PowerWidget, so tile and detail view scale the same way. 0 is
+// the import/export boundary; flatSpan (in W) keeps 1-decimal kW tick
+// labels distinct on a flat line.
+export const POWER_Y_DOMAIN: YDomainOptions = { includeZero: true, flatSpan: 1000 };
+
 // Only avg on by default -- min/max mostly add clutter (a brief dip/spike)
 // unless you're specifically looking for the extremes; avg alone already
 // shows the day's overall shape.
@@ -56,7 +61,7 @@ export function PowerChart({ period, start, end, points }: PowerChartProps) {
   // whole period, independent of which series are currently toggled off --
   // otherwise hiding "max" would visibly rescale the axis, on top of the
   // rescale-on-zoom this domain is already meant to avoid.
-  const domainY = useMemo(() => computeYDomain(points, POWER_KEYS, { includeZero: true }), [points]);
+  const domainY = useMemo(() => computeYDomain(points, POWER_KEYS, POWER_Y_DOMAIN), [points]);
   const {
     rangeX,
     rangeY,

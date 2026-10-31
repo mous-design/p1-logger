@@ -1,0 +1,14 @@
+{
+  "tariffs": [
+    {
+      "until": "2026-12-31",
+      "electricity": { "import_t1": 0.2104, "import_t2": 0.2398, "export_t1": 0.2104, "export_t2": 0.2398 },
+      "gas": 1.2456
+    },
+    {
+      "from": "2027-01-01",
+      "electricity": { "import_t1": 0.2104, "import_t2": 0.2398, "export_t1": 0.05, "export_t2": 0.05 },
+      "gas": 1.2456
+    }
+  ]
+}

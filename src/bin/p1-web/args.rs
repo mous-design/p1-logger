@@ -9,6 +9,9 @@ const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 pub struct Args {
     pub data_dir: PathBuf,
     pub bind_addr: String,
+    /// Optional: without it p1-web runs with no settings file at all (no
+    /// prices, see config.rs).
+    pub config_path: Option<PathBuf>,
     pub want_syslog: bool,
     pub quiet: bool,
 }
@@ -16,6 +19,7 @@ pub struct Args {
 pub fn parse_args(raw: &[String]) -> Result<Args, String> {
     let mut data_dir = None;
     let mut bind_addr = None;
+    let mut config_path = None;
     let mut want_syslog = false;
     let mut quiet = false;
     let mut iter = raw.iter();
@@ -31,11 +35,21 @@ pub fn parse_args(raw: &[String]) -> Result<Args, String> {
                 let value = iter.next().ok_or("--bind needs a value")?;
                 bind_addr = Some(value.clone());
             }
+            "--config" => {
+                let value = iter.next().ok_or("--config needs a value")?;
+                config_path = Some(PathBuf::from(value));
+            }
             other => return Err(format!("unrecognized argument: {other}")),
         }
     }
     let data_dir = data_dir.ok_or_else(|| "missing --data-dir".to_string())?;
-    Ok(Args { data_dir, bind_addr: bind_addr.unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string()), want_syslog, quiet })
+    Ok(Args {
+        data_dir,
+        bind_addr: bind_addr.unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string()),
+        config_path,
+        want_syslog,
+        quiet,
+    })
 }
 
 #[cfg(test)]
@@ -68,6 +82,13 @@ mod tests {
         let args = args(&["--data-dir", "/tmp/data", "-l", "-q"]).unwrap();
         assert!(args.want_syslog);
         assert!(args.quiet);
+    }
+
+    #[test]
+    fn config_is_optional() {
+        assert!(args(&["--data-dir", "/tmp/data"]).unwrap().config_path.is_none());
+        let args = args(&["--data-dir", "/tmp/data", "--config", "/tmp/p1-web.json"]).unwrap();
+        assert_eq!(args.config_path, Some(PathBuf::from("/tmp/p1-web.json")));
     }
 
     #[test]

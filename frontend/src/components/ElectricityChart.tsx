@@ -1,14 +1,16 @@
 import { useMemo, useState } from "react";
-import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { electricityDeltas, electricityNetTotals } from "../chart/deltas";
-import { computeTicks, formatTick, formatTooltipLabel } from "../chart/ticks";
+import { CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { electricityDeltas, electricityTotals } from "../chart/deltas";
+import { computeTicks, computeValueTicks, formatTick, formatTooltipLabel } from "../chart/ticks";
 import { useAxisZoom } from "../chart/useAxisZoom";
 import { AXIS_TICK_FONT_SIZE, CHART_MARGIN, X_AXIS_HEIGHT, Y_AXIS_WIDTH } from "../chart/zoom";
 import { AxisScrollbar } from "../chart/AxisScrollbar";
-import { computeYDomain } from "../chart/range";
+import { computeYDomain, type YDomainOptions } from "../chart/range";
 import { ZoomIconGutter } from "../chart/ZoomIconGutter";
 import type { ElectricityPoint, Period } from "../types";
-import { formatMilli, tooltipFormatter } from "../chart/format";
+import { formatEuro, formatMilli, tooltipFormatter } from "../chart/format";
+import { electricityCosts } from "../chart/costs";
+import { useTariffs } from "../hooks/useTariffs";
 
 // Shared with ElectricityWidget's compact MiniChart, so the tile and the
 // detail view always use the same colors for T1/T2.
@@ -27,6 +29,11 @@ export const ELECTRICITY_COMBINED_SERIES = [{ dataKey: "combined_wh", name: "Tot
 const ELECTRICITY_DETAIL_SERIES = [...ELECTRICITY_SERIES, ...ELECTRICITY_COMBINED_SERIES] as const;
 const ELECTRICITY_KEYS = ELECTRICITY_DETAIL_SERIES.map((s) => s.dataKey);
 
+// Shared with ElectricityWidget, so tile and detail view scale the same way.
+// Net usage per hour is signed (export below 0), so 0 is the line that
+// matters; flatSpan (in Wh) keeps 1-decimal kWh tick labels distinct.
+export const ELECTRICITY_Y_DOMAIN: YDomainOptions = { includeZero: true, flatSpan: 1000 };
+
 // Only the combined total on by default -- T1/T2 individually mostly
 // matters when you're specifically comparing tariffs, not for the everyday
 // "how much did I use" glance.
@@ -43,9 +50,25 @@ export function formatKwh(wh: number): string {
 const formatTooltipValueKwh = tooltipFormatter((wh) => formatMilli(wh, "kWh", 3));
 
 // A standalone headline number gets more precision than an axis tick does --
-// no shared-width constraint to worry about here.
-function formatKwhSummary(wh: number): string {
-  return formatMilli(wh, "kWh", 2);
+// no shared-width constraint to worry about here. "—" for a register total
+// that can't be computed yet (see ElectricityTotals).
+function formatKwhSummary(wh: number | null): string {
+  return wh === null ? "—" : formatMilli(wh, "kWh", 2);
+}
+
+// kWh with its price after it: `eur` undefined means no tariffs are
+// configured (no price shown at all), null means not computable ("—").
+function formatKwhWithEuro(wh: number | null, eur: number | null | undefined): string {
+  if (eur === undefined) return formatKwhSummary(wh);
+  return `${formatKwhSummary(wh)} (${eur === null ? "—" : formatEuro(eur)})`;
+}
+
+function minus(a: number | null, b: number | null): number | null {
+  return a === null || b === null ? null : a - b;
+}
+
+function plus(a: number | null, b: number | null): number | null {
+  return a === null || b === null ? null : a + b;
 }
 
 interface ElectricityChartProps {
@@ -58,8 +81,14 @@ interface ElectricityChartProps {
 
 export function ElectricityChart({ period, start, end, baseline, points }: ElectricityChartProps) {
   const deltaPoints = useMemo(() => electricityDeltas(points, baseline), [points, baseline]);
-  const totals = useMemo(() => electricityNetTotals(points, baseline), [points, baseline]);
-  const domainY = useMemo(() => computeYDomain(deltaPoints, ELECTRICITY_KEYS), [deltaPoints]);
+  const totals = useMemo(() => electricityTotals(points, baseline), [points, baseline]);
+  const tariffs = useTariffs();
+  const costs = useMemo(() => (tariffs ? electricityCosts(points, baseline, tariffs) : null), [points, baseline, tariffs]);
+  // A tariff's own total is what it cost net: used minus delivered back.
+  // `netEur` is null without tariffs, so `netEur?.t1` reads as undefined
+  // ("no price shown") -- distinct from a null t1 ("not computable").
+  const netEur = costs && { t1: minus(costs.importT1Eur, costs.exportT1Eur), t2: minus(costs.importT2Eur, costs.exportT2Eur) };
+  const domainY = useMemo(() => computeYDomain(deltaPoints, ELECTRICITY_KEYS, ELECTRICITY_Y_DOMAIN), [deltaPoints]);
   const {
     rangeX,
     rangeY,
@@ -82,6 +111,7 @@ export function ElectricityChart({ period, start, end, baseline, points }: Elect
     canResetY,
   } = useAxisZoom({ start, end }, domainY);
   const ticks = useMemo(() => computeTicks(rangeX.start, rangeX.end), [rangeX.start, rangeX.end]);
+  const valueTicks = useMemo(() => computeValueTicks(rangeY.start, rangeY.end, 8), [rangeY.start, rangeY.end]);
   const [hiddenKeys, setHiddenKeys] = useState<Set<string>>(HIDDEN_BY_DEFAULT);
 
   function toggleSeries(dataKey: string) {
@@ -99,9 +129,18 @@ export function ElectricityChart({ period, start, end, baseline, points }: Elect
   return (
     <div>
       <p className="sign-legend">Positief = verbruik (import), negatief = teruglevering (export)</p>
+      {/* Per tariff, delivered and used separately -- what's needed to price
+          a period, since delivering and using are paid at different rates. */}
+      <p className="register-totals">
+        T1: geleverd {formatKwhWithEuro(totals.exportT1Wh, costs?.exportT1Eur)}, verbruikt{" "}
+        {formatKwhWithEuro(totals.importT1Wh, costs?.importT1Eur)}, totaal {formatKwhWithEuro(totals.netT1Wh, netEur?.t1)}
+      </p>
+      <p className="register-totals">
+        T2: geleverd {formatKwhWithEuro(totals.exportT2Wh, costs?.exportT2Eur)}, verbruikt{" "}
+        {formatKwhWithEuro(totals.importT2Wh, costs?.importT2Eur)}, totaal {formatKwhWithEuro(totals.netT2Wh, netEur?.t2)}
+      </p>
       <p className="net-total">
-        Verbruikt: T1 {formatKwhSummary(totals.t1Wh)}, T2 {formatKwhSummary(totals.t2Wh)}, Totaal{" "}
-        {formatKwhSummary(totals.t1Wh + totals.t2Wh)}
+        Totaal: {formatKwhWithEuro(totals.netT1Wh + totals.netT2Wh, netEur ? plus(netEur.t1, netEur.t2) : undefined)}
       </p>
       <div className="series-toggle-row">
         {ELECTRICITY_DETAIL_SERIES.map((s) => {
@@ -148,10 +187,12 @@ export function ElectricityChart({ period, start, end, baseline, points }: Elect
                 <YAxis
                   width={Y_AXIS_WIDTH}
                   domain={[rangeY.start, rangeY.end]}
+                  ticks={valueTicks}
                   allowDataOverflow
                   tickFormatter={formatKwh}
                   tick={{ fontSize: AXIS_TICK_FONT_SIZE }}
                 />
+                <ReferenceLine y={0} className="zero-line" />
                 <Tooltip labelFormatter={(t) => formatTooltipLabel(period, t)} formatter={formatTooltipValueKwh} />
                 {ELECTRICITY_DETAIL_SERIES.map((s) => (
                   <Line

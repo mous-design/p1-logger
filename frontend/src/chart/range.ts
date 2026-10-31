@@ -75,20 +75,29 @@ export function resizeRangeEdge(range: NumRange, domain: NumRange, edge: "start"
 // padding by hand too.
 const Y_DOMAIN_PADDING_FRACTION = 0.08;
 
+export interface YDomainOptions {
+  /** For metrics where 0 is the line that matters (power, net electricity:
+   * import above, export below; gas: the floor) -- without it, a
+   * consumption-only night would scale to e.g. 0.2-0.4 kW and hide the
+   * baseline entirely. No padding is added past a zero edge: that would
+   * only add an empty strip beyond the baseline (a "-0.2 kW" tick on a night
+   * with no export at all, or a negative gas axis). */
+  includeZero?: boolean;
+  /** Span to show when the data is flat (every value equal -- typically all
+   * 0, like a summer day without any gas use) or absent, in the metric's
+   * own milli-unit. Picked per chart so the axis still gets distinct,
+   * readable tick labels instead of a +-1 milli-unit sliver. */
+  flatSpan?: number;
+}
+
 /** The full y-domain for a chart, computed once from *all* of a period's
  * data across the given series keys -- not just whatever's currently
  * visible, and not recomputed per zoom/toggle, so panning/zooming and
- * hiding a series never rescales the axis out from under the reader.
- *
- * `includeZero` is for signed metrics where 0 is the line that matters
- * (power: import above, export below) -- without it, a consumption-only
- * night would scale to e.g. 0.2-0.4 kW and hide the baseline entirely. No
- * padding is added past a zero edge: that would only add an empty strip
- * beyond the baseline (a "-0.2 kW" tick on a night with no export at all). */
+ * hiding a series never rescales the axis out from under the reader. */
 export function computeYDomain<T>(
   points: T[],
   keys: readonly (keyof T)[],
-  { includeZero = false }: { includeZero?: boolean } = {},
+  { includeZero = false, flatSpan = 2 }: YDomainOptions = {},
 ): NumRange {
   let min = Infinity;
   let max = -Infinity;
@@ -101,14 +110,16 @@ export function computeYDomain<T>(
     }
   }
   if (!Number.isFinite(min) || !Number.isFinite(max)) {
-    return { start: 0, end: 1 };
+    return { start: 0, end: flatSpan };
   }
   if (includeZero) {
     min = Math.min(min, 0);
     max = Math.max(max, 0);
   }
   if (min === max) {
-    return { start: min - 1, end: max + 1 };
+    // With includeZero, flat data can only be all-zero: grow upward from
+    // the baseline rather than centering on it, so it never dips below 0.
+    return includeZero ? { start: 0, end: flatSpan } : { start: min - flatSpan / 2, end: max + flatSpan / 2 };
   }
   const padding = (max - min) * Y_DOMAIN_PADDING_FRACTION;
   return {

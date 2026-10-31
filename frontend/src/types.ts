@@ -29,6 +29,12 @@ export interface ElectricityPoint {
   t: number;
   net_t1_wh: number;
   net_t2_wh: number;
+  /** Raw register readings at the end of the hour -- null for hours that
+   * haven't been (re-)aggregated since these were added server-side. */
+  import_t1_wh: number | null;
+  export_t1_wh: number | null;
+  import_t2_wh: number | null;
+  export_t2_wh: number | null;
 }
 
 export interface ElectricitySeries {
@@ -74,4 +80,24 @@ export interface CurrentReadings {
   import_t2_wh: number | null;
   export_t2_wh: number | null;
   gas_dm3: number | null;
+}
+
+/** € per kWh. */
+export interface ElectricityPrices {
+  import_t1: number;
+  import_t2: number;
+  export_t1: number;
+  export_t2: number;
+}
+
+/** One contract period from p1-web's config. `from`/`until` are inclusive
+ * local calendar days ("YYYY-MM-DD"); null only on the first period's `from`
+ * and the last period's `until`. The server guarantees the periods join up
+ * without gaps or overlaps, so every moment falls in exactly one. */
+export interface TariffPeriod {
+  from: string | null;
+  until: string | null;
+  electricity: ElectricityPrices;
+  /** € per m³. */
+  gas: number;
 }

@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, Result};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -17,6 +17,10 @@ pub struct ElectricityMeterBucket {
     pub bucket_start: i64,
     pub net_t1_wh: i64,
     pub net_t2_wh: i64,
+    pub import_t1_wh: Option<i64>,
+    pub export_t1_wh: Option<i64>,
+    pub import_t2_wh: Option<i64>,
+    pub export_t2_wh: Option<i64>,
 }
 
 pub struct GasMeterBucket {
@@ -34,7 +38,7 @@ pub struct DayAggregate {
 
 /// Reads every (timestamp, value) row for one OBIS-derived type, in
 /// timestamp order.
-fn read_series_sorted(conn: &Connection, kind: &str) -> rusqlite::Result<Vec<(i64, i64)>> {
+fn read_series_sorted(conn: &Connection, kind: &str) -> Result<Vec<(i64, i64)>> {
     let mut stmt = conn.prepare("SELECT timestamp, value FROM readings WHERE type = ?1 ORDER BY timestamp")?;
     stmt.query_map([kind], |row| Ok((row.get(0)?, row.get(1)?)))?.collect()
 }
@@ -81,7 +85,7 @@ fn net_series_sorted(
     import_kind: &str,
     export_kind: &str,
     quiet: bool,
-) -> rusqlite::Result<Vec<(i64, i64)>> {
+) -> Result<Vec<(i64, i64)>> {
     let imports = dedup_last_per_timestamp(read_series_sorted(conn, import_kind)?);
     // For exports: convert vec to hashmap for O(1) lookup. Explicit dedup
     // here too even though collect() into a HashMap already keeps only the
@@ -179,9 +183,14 @@ fn last_value_per_hour(series: Vec<(i64, i64)>) -> HashMap<i64, i64> {
     last
 }
 
-fn electricity_meter_buckets(conn: &Connection, quiet: bool) -> rusqlite::Result<Vec<ElectricityMeterBucket>> {
+fn electricity_meter_buckets(conn: &Connection, quiet: bool) -> Result<Vec<ElectricityMeterBucket>> {
     let net_t1 = last_value_per_hour(net_series_sorted(conn, "E-import-T1", "E-export-T1", quiet)?);
     let net_t2 = last_value_per_hour(net_series_sorted(conn, "E-import-T2", "E-export-T2", quiet)?);
+    let register = |kind: &str| -> Result<HashMap<i64, i64>> { Ok(last_value_per_hour(read_series_sorted(conn, kind)?)) };
+    let import_t1 = register("E-import-T1")?;
+    let export_t1 = register("E-export-T1")?;
+    let import_t2 = register("E-import-T2")?;
+    let export_t2 = register("E-export-T2")?;
 
     // Union of both hour-sets: T1 and T2 normally cover the same hours (one
     // telegram contributes to both every time), but an hour where every
@@ -195,7 +204,15 @@ fn electricity_meter_buckets(conn: &Connection, quiet: bool) -> rusqlite::Result
     Ok(hours
         .into_iter()
         .filter_map(|bucket_start| match (net_t1.get(&bucket_start), net_t2.get(&bucket_start)) {
-            (Some(&net_t1_wh), Some(&net_t2_wh)) => Some(ElectricityMeterBucket { bucket_start, net_t1_wh, net_t2_wh }),
+            (Some(&net_t1_wh), Some(&net_t2_wh)) => Some(ElectricityMeterBucket {
+                bucket_start,
+                net_t1_wh,
+                net_t2_wh,
+                import_t1_wh: import_t1.get(&bucket_start).copied(),
+                export_t1_wh: export_t1.get(&bucket_start).copied(),
+                import_t2_wh: import_t2.get(&bucket_start).copied(),
+                export_t2_wh: export_t2.get(&bucket_start).copied(),
+            }),
             _ => {
                 if !quiet {
                     log::warn!(
@@ -209,7 +226,7 @@ fn electricity_meter_buckets(conn: &Connection, quiet: bool) -> rusqlite::Result
         .collect())
 }
 
-fn gas_meter_buckets(conn: &Connection) -> rusqlite::Result<Vec<GasMeterBucket>> {
+fn gas_meter_buckets(conn: &Connection) -> Result<Vec<GasMeterBucket>> {
     let mut hours: Vec<(i64, i64)> = last_value_per_hour(read_series_sorted(conn, "G-import")?).into_iter().collect();
     hours.sort_unstable_by_key(|(bucket_start, _)| *bucket_start);
     Ok(hours
@@ -222,7 +239,7 @@ fn gas_meter_buckets(conn: &Connection) -> rusqlite::Result<Vec<GasMeterBucket>>
 /// `write_day`'s doc comment -- pass `true` while a day is still "today"
 /// (recomputed hourly, so its own anomalies would otherwise repeat all day),
 /// `false` for its one-time, final computation right before archiving.
-pub fn compute_day(conn: &Connection, quiet: bool) -> rusqlite::Result<DayAggregate> {
+pub fn compute_day(conn: &Connection, quiet: bool) -> Result<DayAggregate> {
     let net = net_series_sorted(conn, "P-import", "P-export", quiet)?;
     Ok(DayAggregate {
         power_1min: bucket_power(&net, SECONDS_PER_MINUTE),
@@ -232,7 +249,7 @@ pub fn compute_day(conn: &Connection, quiet: bool) -> rusqlite::Result<DayAggreg
     })
 }
 
-pub fn open_aggregates_db(path: &Path) -> rusqlite::Result<Connection> {
+pub fn open_aggregates_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -252,14 +269,36 @@ pub fn open_aggregates_db(path: &Path) -> rusqlite::Result<Connection> {
         CREATE TABLE IF NOT EXISTS meter_electricity (
             bucket_start INTEGER NOT NULL PRIMARY KEY,
             net_t1_wh INTEGER NOT NULL,
-            net_t2_wh INTEGER NOT NULL
+            net_t2_wh INTEGER NOT NULL,
+            import_t1_wh INTEGER,
+            export_t1_wh INTEGER,
+            import_t2_wh INTEGER,
+            export_t2_wh INTEGER
         );
         CREATE TABLE IF NOT EXISTS meter_gas (
             bucket_start INTEGER NOT NULL PRIMARY KEY,
             import_dm3 INTEGER NOT NULL
         );",
     )?;
+    // `CREATE TABLE IF NOT EXISTS` never touches a table that already
+    // exists, so a column added after a database was first created needs its
+    // own ALTER TABLE. Nullable on purpose: rows written before the column
+    // existed stay NULL until their day gets re-aggregated.
+    for column in ["import_t1_wh", "export_t1_wh", "import_t2_wh", "export_t2_wh"] {
+        add_column_if_missing(&conn, "meter_electricity", column)?;
+    }
     Ok(conn)
+}
+
+/// `table`/`column` are this module's own constants, never input -- the
+/// one reason building the ALTER TABLE by format! is fine here.
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str) -> Result<()> {
+    let exists = conn.prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?.exists((table, column))?;
+    if !exists {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} INTEGER"))?;
+        log::info!("added column {table}.{column}");
+    }
+    Ok(())
 }
 
 fn in_day_range(bucket_start: i64, day_start: i64, day_end: i64) -> bool {
@@ -327,7 +366,7 @@ pub fn write_day(
     day_end: i64,
     data: &DayAggregate,
     quiet: bool,
-) -> rusqlite::Result<()> {
+) -> Result<()> {
     let tx = aggregates_conn.transaction()?;
     {
         tx.execute("DELETE FROM power_1min WHERE bucket_start >= ?1 AND bucket_start < ?2", (day_start, day_end))?;
@@ -362,7 +401,9 @@ pub fn write_day(
         drop(power_1day_stmt);
 
         let mut electricity_stmt = tx.prepare_cached(
-            "INSERT INTO meter_electricity (bucket_start, net_t1_wh, net_t2_wh) VALUES (?1, ?2, ?3)",
+            "INSERT INTO meter_electricity \
+             (bucket_start, net_t1_wh, net_t2_wh, import_t1_wh, export_t1_wh, import_t2_wh, export_t2_wh) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
         for bucket in &data.meter_electricity {
             if !in_day_range(bucket.bucket_start, day_start, day_end) {
@@ -371,7 +412,15 @@ pub fn write_day(
                 }
                 continue;
             }
-            electricity_stmt.execute((bucket.bucket_start, bucket.net_t1_wh, bucket.net_t2_wh))?;
+            electricity_stmt.execute((
+                bucket.bucket_start,
+                bucket.net_t1_wh,
+                bucket.net_t2_wh,
+                bucket.import_t1_wh,
+                bucket.export_t1_wh,
+                bucket.import_t2_wh,
+                bucket.export_t2_wh,
+            ))?;
         }
         drop(electricity_stmt);
 
@@ -397,6 +446,16 @@ pub fn write_day(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::{env, fs, process};
+
+    /// A per-test, per-process database path with any leftover from an
+    /// earlier aborted run already removed -- so each test starts empty.
+    fn fresh_db_path(name: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!("p1-aggregate-{name}-test-{}.sqlite3", process::id()));
+        let _ = fs::remove_file(&path);
+        path
+    }
 
     #[test]
     fn buckets_min_avg_max_per_window() {
@@ -440,8 +499,7 @@ mod tests {
 
     #[test]
     fn schema_creates_all_four_tables() {
-        let path = std::env::temp_dir().join(format!("p1-aggregate-schema-test-{}.sqlite3", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let path = fresh_db_path("schema");
 
         let conn = open_aggregates_db(&path).unwrap();
         for table in ["power_1min", "power_1day", "meter_electricity", "meter_gas"] {
@@ -453,13 +511,12 @@ mod tests {
             assert_eq!(count, 1, "expected table {table} to exist");
         }
         drop(conn);
-        std::fs::remove_file(&path).unwrap();
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]
     fn write_day_is_idempotent_on_rerun() {
-        let path = std::env::temp_dir().join(format!("p1-aggregate-idempotent-test-{}.sqlite3", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let path = fresh_db_path("idempotent");
         let mut conn = open_aggregates_db(&path).unwrap();
 
         let data = DayAggregate {
@@ -476,7 +533,7 @@ mod tests {
         assert_eq!(count, 1, "rerunning must not duplicate rows");
 
         drop(conn);
-        std::fs::remove_file(&path).unwrap();
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -486,9 +543,7 @@ mod tests {
         // computed bucket for the *next* day. Simulates that: day 0 computes
         // one in-range bucket plus one stray bucket landing exactly at the
         // next day's bucket_start.
-        let path = std::env::temp_dir()
-            .join(format!("p1-aggregate-boundary-test-{}.sqlite3", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let path = fresh_db_path("boundary");
         let mut conn = open_aggregates_db(&path).unwrap();
 
         let day0 = DayAggregate {
@@ -520,7 +575,7 @@ mod tests {
         assert_eq!(value, 200, "day 1's real value must win, not day 0's stray one");
 
         drop(conn);
-        std::fs::remove_file(&path).unwrap();
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -541,9 +596,7 @@ mod tests {
         // whether the "beyond tolerance" branch logs: a gas bucket far
         // outside the day's range is dropped, exactly like an in-tolerance
         // one -- the tolerance only controls whether it's also logged.
-        let path = std::env::temp_dir()
-            .join(format!("p1-aggregate-gas-tolerance-test-{}.sqlite3", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let path = fresh_db_path("gas-tolerance");
         let mut conn = open_aggregates_db(&path).unwrap();
 
         let data = DayAggregate {
@@ -562,7 +615,7 @@ mod tests {
         assert_eq!(count, 1, "the far-out-of-range bucket must still be dropped, not inserted");
 
         drop(conn);
-        std::fs::remove_file(&path).unwrap();
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -586,6 +639,39 @@ mod tests {
         assert_eq!(buckets[0].bucket_start, 0);
         assert_eq!(buckets[0].net_t1_wh, 90, "100 import - 10 export");
         assert_eq!(buckets[0].net_t2_wh, 180, "200 import - 20 export");
+        assert_eq!(buckets[0].import_t1_wh, Some(100));
+        assert_eq!(buckets[0].export_t1_wh, Some(10));
+        assert_eq!(buckets[0].import_t2_wh, Some(200));
+        assert_eq!(buckets[0].export_t2_wh, Some(20));
+    }
+
+    #[test]
+    fn open_aggregates_db_adds_register_columns_to_an_existing_meter_electricity_table() {
+        let path = fresh_db_path("migration");
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(
+                "CREATE TABLE meter_electricity (
+                    bucket_start INTEGER NOT NULL PRIMARY KEY,
+                    net_t1_wh INTEGER NOT NULL,
+                    net_t2_wh INTEGER NOT NULL
+                );
+                INSERT INTO meter_electricity VALUES (0, 90, 180);",
+            )
+            .unwrap();
+        }
+
+        let conn = open_aggregates_db(&path).unwrap();
+        let row: (i64, Option<i64>, Option<i64>) = conn
+            .query_row("SELECT net_t1_wh, import_t1_wh, export_t2_wh FROM meter_electricity", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(row, (90, None, None), "existing rows keep their nets, new columns start out NULL");
+        drop(conn);
+
+        open_aggregates_db(&path).expect("re-opening an already-migrated database must be a no-op");
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]

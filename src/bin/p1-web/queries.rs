@@ -62,12 +62,20 @@ pub fn electricity(path: &Path, start: i64, end: i64) -> rusqlite::Result<MeterS
         return Ok(MeterSeries { baseline: None, buckets: Vec::new() });
     };
     let mut stmt = conn.prepare(
-        "SELECT bucket_start, net_t1_wh, net_t2_wh FROM meter_electricity \
-         WHERE bucket_start >= ?1 AND bucket_start < ?2 ORDER BY bucket_start",
+        "SELECT bucket_start, net_t1_wh, net_t2_wh, import_t1_wh, export_t1_wh, import_t2_wh, export_t2_wh \
+         FROM meter_electricity WHERE bucket_start >= ?1 AND bucket_start < ?2 ORDER BY bucket_start",
     )?;
     let mut buckets: Vec<ElectricityMeterBucket> = stmt
         .query_map((start - SECONDS_PER_HOUR, end), |row| {
-            Ok(ElectricityMeterBucket { bucket_start: row.get(0)?, net_t1_wh: row.get(1)?, net_t2_wh: row.get(2)? })
+            Ok(ElectricityMeterBucket {
+                bucket_start: row.get(0)?,
+                net_t1_wh: row.get(1)?,
+                net_t2_wh: row.get(2)?,
+                import_t1_wh: row.get(3)?,
+                export_t1_wh: row.get(4)?,
+                import_t2_wh: row.get(5)?,
+                export_t2_wh: row.get(6)?,
+            })
         })?
         .collect::<rusqlite::Result<_>>()?;
     let baseline = buckets.first().is_some_and(|b| b.bucket_start < start).then(|| buckets.remove(0));

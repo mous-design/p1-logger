@@ -2,7 +2,7 @@ import { useMemo } from "react";
 import { gasDeltas } from "../chart/deltas";
 import { MiniChart } from "../chart/MiniChart";
 import { useTodaySeries } from "../hooks/useTodaySeries";
-import { formatM3, GAS_SERIES } from "./GasChart";
+import { formatM3, GAS_SERIES, GAS_Y_DOMAIN } from "./GasChart";
 import { WidgetTile } from "./WidgetTile";
 
 export function GasWidget({ onOpen }: { onOpen: () => void }) {
@@ -11,7 +11,7 @@ export function GasWidget({ onOpen }: { onOpen: () => void }) {
 
   return (
     <WidgetTile title="Gasverbruik" onOpen={onOpen} loading={loading} error={error}>
-      {data?.metric === "gas" && <MiniChart points={deltaPoints} series={GAS_SERIES} height={280} formatY={formatM3} />}
+      {data?.metric === "gas" && <MiniChart points={deltaPoints} series={GAS_SERIES} height={280} formatY={formatM3} yDomain={GAS_Y_DOMAIN} />}
     </WidgetTile>
   );
 }

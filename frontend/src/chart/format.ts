@@ -18,3 +18,9 @@ export function tooltipFormatter(format: (value: number) => string) {
     String(name),
   ];
 }
+
+/** "0.20€" -- the euro sign after the amount, matching the summary lines it's
+ * used in. Rounds a tiny negative to "0.00€" instead of "-0.00€". */
+export function formatEuro(eur: number): string {
+  return `${(Math.abs(eur) < 0.005 ? 0 : eur).toFixed(2)}€`;
+}

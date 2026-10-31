@@ -4,6 +4,7 @@
 mod api;
 mod args;
 mod assets;
+mod config;
 mod period;
 mod queries;
 mod run;
@@ -14,7 +15,7 @@ fn main() -> std::process::ExitCode {
         Ok(args) => args,
         Err(err) => {
             eprintln!("error: {err}");
-            eprintln!("usage: p1-web --data-dir <dir> [--bind <addr>] [-l] [-q]");
+            eprintln!("usage: p1-web --data-dir <dir> [--bind <addr>] [--config <file>] [-l] [-q]");
             return std::process::ExitCode::FAILURE;
         }
     };
@@ -40,8 +41,23 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    let aggregates_path = args.data_dir.join("aggregates.sqlite3");
-    match run::run(&args.bind_addr, args.data_dir, aggregates_path) {
+    let config = match &args.config_path {
+        Some(path) => match config::load(path) {
+            Ok(config) => Some(config),
+            Err(err) => {
+                eprintln!("error: {err}");
+                return std::process::ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+
+    let state = api::AppState {
+        aggregates_path: args.data_dir.join("aggregates.sqlite3"),
+        data_dir: args.data_dir,
+        tariffs: config.and_then(|config| config.tariffs),
+    };
+    match run::run(&args.bind_addr, state) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
             log::error!("p1-web failed: {err}");

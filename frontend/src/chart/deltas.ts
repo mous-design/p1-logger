@@ -2,7 +2,7 @@ import type { ElectricityPoint, GasPoint } from "../types";
 
 // combined_wh (T1+T2) is derived here, not re-derived in every consumer --
 // both the Elektra detail chart and its dashboard tile need it.
-export interface ElectricityDeltaPoint extends ElectricityPoint {
+export interface ElectricityDeltaPoint extends Pick<ElectricityPoint, "t" | "net_t1_wh" | "net_t2_wh"> {
   combined_wh: number;
 }
 
@@ -29,13 +29,40 @@ export function electricityDeltas(points: ElectricityPoint[], baseline: Electric
   });
 }
 
-// The period's net total: last reading minus the register at the period's
+export interface ElectricityTotals {
+  netT1Wh: number;
+  netT2Wh: number;
+  /** Taken from the grid / delivered to it, per tariff -- null when either
+   * end of the period predates the register columns (see ElectricityPoint). */
+  importT1Wh: number | null;
+  exportT1Wh: number | null;
+  importT2Wh: number | null;
+  exportT2Wh: number | null;
+}
+
+export type RegisterKey = "import_t1_wh" | "export_t1_wh" | "import_t2_wh" | "export_t2_wh";
+
+// The period's totals: last reading minus the register at the period's
 // start -- equal to the sum of electricityDeltas, first bucket included.
-export function electricityNetTotals(points: ElectricityPoint[], baseline: ElectricityPoint | undefined): { t1Wh: number; t2Wh: number } {
+export function electricityTotals(points: ElectricityPoint[], baseline: ElectricityPoint | undefined): ElectricityTotals {
   const first = baseline ?? points[0];
   const last = points[points.length - 1];
-  if (!first || !last) return { t1Wh: 0, t2Wh: 0 };
-  return { t1Wh: last.net_t1_wh - first.net_t1_wh, t2Wh: last.net_t2_wh - first.net_t2_wh };
+  if (!first || !last) {
+    return { netT1Wh: 0, netT2Wh: 0, importT1Wh: 0, exportT1Wh: 0, importT2Wh: 0, exportT2Wh: 0 };
+  }
+  const registerTotal = (key: RegisterKey): number | null => {
+    const from = first[key];
+    const to = last[key];
+    return from === null || to === null ? null : to - from;
+  };
+  return {
+    netT1Wh: last.net_t1_wh - first.net_t1_wh,
+    netT2Wh: last.net_t2_wh - first.net_t2_wh,
+    importT1Wh: registerTotal("import_t1_wh"),
+    exportT1Wh: registerTotal("export_t1_wh"),
+    importT2Wh: registerTotal("import_t2_wh"),
+    exportT2Wh: registerTotal("export_t2_wh"),
+  };
 }
 
 export function gasDeltas(points: GasPoint[], baseline: GasPoint | undefined): GasPoint[] {
@@ -45,7 +72,7 @@ export function gasDeltas(points: GasPoint[], baseline: GasPoint | undefined): G
   });
 }
 
-// Same reasoning as electricityNetTotals.
+// Same reasoning as electricityTotals.
 export function gasNetTotal(points: GasPoint[], baseline: GasPoint | undefined): number {
   const first = baseline ?? points[0];
   const last = points[points.length - 1];

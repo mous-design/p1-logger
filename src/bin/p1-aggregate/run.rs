@@ -87,6 +87,13 @@ fn process_day(
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let is_today = day_start >= today_start;
 
+    // Deliberately read-write, even though this only reads: the day-files
+    // are WAL-mode, and closing the last connection is what checkpoints any
+    // leftover -wal content back into the main file and deletes -wal/-shm.
+    // The archive step below moves only the main file, so it relies on
+    // exactly that. A read-only connection can't checkpoint: it would leave
+    // -wal/-shm behind in the data-dir, and archive a file missing whatever
+    // that -wal still held.
     let raw_conn = Connection::open(path)?;
     let data = aggregate::compute_day(&raw_conn, is_today)?;
     drop(raw_conn);

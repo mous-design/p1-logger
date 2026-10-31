@@ -1,9 +1,10 @@
+use crate::config::TariffPeriod;
 use crate::period::{self, Period};
 use crate::queries;
 use p1_logger::aggregate::{ElectricityMeterBucket, GasMeterBucket, PowerBucket};
 use serde::Serialize;
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tiny_http::{Header, Response};
 
 #[derive(Serialize)]
@@ -19,6 +20,12 @@ struct ElectricityPoint {
     t: i64,
     net_t1_wh: i64,
     net_t2_wh: i64,
+    /// Raw register readings, `null` until that hour's day has been
+    /// (re-)aggregated with them -- see `ElectricityMeterBucket`.
+    import_t1_wh: Option<i64>,
+    export_t1_wh: Option<i64>,
+    import_t2_wh: Option<i64>,
+    export_t2_wh: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -42,13 +49,30 @@ struct SeriesResponse<P> {
     points: Vec<P>,
 }
 
+/// `tariffs` is `null` when none are configured -- the frontend's cue to
+/// show no euro amounts at all.
+#[derive(Serialize)]
+struct TariffsResponse<'a> {
+    tariffs: Option<&'a [TariffPeriod]>,
+}
+
 #[derive(Serialize)]
 struct ErrorResponse<'a> {
     error: &'a str,
 }
 
-/// Handles `GET /api/series/<metric>?period=...&anchor=...` and
-/// `GET /api/current`. `None` if `path` isn't under `/api/` at all -- the
+/// Everything a request handler needs, fixed for p1-web's whole lifetime --
+/// one shared value instead of threading each piece through separately.
+pub struct AppState {
+    pub data_dir: PathBuf,
+    pub aggregates_path: PathBuf,
+    /// From `--config`; `None` without a config file or without a
+    /// `tariffs` key in it.
+    pub tariffs: Option<Vec<TariffPeriod>>,
+}
+
+/// Handles `GET /api/series/<metric>?period=...&anchor=...`, `GET /api/current`
+/// and `GET /api/tariffs`. `None` if `path` isn't under `/api/` at all -- the
 /// caller tries the next candidate handler (static assets) for that case.
 ///
 /// One match on up to 4 path segments (deepest known route, `/api/series/<metric>`,
@@ -56,11 +80,12 @@ struct ErrorResponse<'a> {
 /// path that doesn't match a known route still resolves to `Some(404)` here
 /// rather than `None`, so a typo'd or unknown API path can't leak through to
 /// the asset handler's SPA fallback and get served `index.html`.
-pub fn handle(data_dir: &Path, aggregates_path: &Path, path: &str, query: &str) -> Option<Response<Cursor<Vec<u8>>>> {
+pub fn handle(state: &AppState, path: &str, query: &str) -> Option<Response<Cursor<Vec<u8>>>> {
     let mut segments = path.trim_start_matches('/').split('/');
     match (segments.next(), segments.next(), segments.next(), segments.next()) {
-        (Some("api"), Some("current"), None, None) => Some(handle_current(data_dir)),
-        (Some("api"), Some("series"), Some(metric), None) => Some(handle_series(aggregates_path, metric, query)),
+        (Some("api"), Some("current"), None, None) => Some(handle_current(&state.data_dir)),
+        (Some("api"), Some("series"), Some(metric), None) => Some(handle_series(&state.aggregates_path, metric, query)),
+        (Some("api"), Some("tariffs"), None, None) => Some(json_response(TariffsResponse { tariffs: state.tariffs.as_deref() })),
         (Some("api"), ..) => Some(error_response(404, "not found")),
         _ => None,
     }
@@ -129,7 +154,15 @@ fn power_point(b: PowerBucket) -> PowerPoint {
 }
 
 fn electricity_point(b: ElectricityMeterBucket) -> ElectricityPoint {
-    ElectricityPoint { t: b.bucket_start, net_t1_wh: b.net_t1_wh, net_t2_wh: b.net_t2_wh }
+    ElectricityPoint {
+        t: b.bucket_start,
+        net_t1_wh: b.net_t1_wh,
+        net_t2_wh: b.net_t2_wh,
+        import_t1_wh: b.import_t1_wh,
+        export_t1_wh: b.export_t1_wh,
+        import_t2_wh: b.import_t2_wh,
+        export_t2_wh: b.export_t2_wh,
+    }
 }
 
 fn gas_point(b: GasMeterBucket) -> GasPoint {

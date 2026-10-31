@@ -1,14 +1,16 @@
 import { useMemo } from "react";
-import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { gasDeltas, gasNetTotal } from "../chart/deltas";
-import { computeTicks, formatTick, formatTooltipLabel } from "../chart/ticks";
+import { computeTicks, computeValueTicks, formatTick, formatTooltipLabel } from "../chart/ticks";
 import { useAxisZoom } from "../chart/useAxisZoom";
 import { AXIS_TICK_FONT_SIZE, CHART_MARGIN, X_AXIS_HEIGHT, Y_AXIS_WIDTH } from "../chart/zoom";
 import { AxisScrollbar } from "../chart/AxisScrollbar";
-import { computeYDomain } from "../chart/range";
+import { computeYDomain, type YDomainOptions } from "../chart/range";
 import { ZoomIconGutter } from "../chart/ZoomIconGutter";
 import type { GasPoint, Period } from "../types";
-import { formatMilli, tooltipFormatter } from "../chart/format";
+import { formatEuro, formatMilli, tooltipFormatter } from "../chart/format";
+import { gasCost } from "../chart/costs";
+import { useTariffs } from "../hooks/useTariffs";
 
 // Shared with GasWidget's compact MiniChart and the Tellerstanden tile, so
 // gas always reads in the same color. Not a CSS token like --import/--export:
@@ -17,6 +19,12 @@ import { formatMilli, tooltipFormatter } from "../chart/format";
 export const GAS_COLOR = "#8884d8";
 export const GAS_SERIES = [{ dataKey: "import_dm3", name: "verbruik", color: GAS_COLOR }] as const;
 const GAS_KEYS = GAS_SERIES.map((s) => s.dataKey);
+
+// Shared with GasWidget, so tile and detail view scale the same way. Gas
+// usage is never negative, so includeZero makes 0 the axis floor -- also on
+// a day without any gas use, where flatSpan (in dm3) keeps the 2-decimal m3
+// tick labels distinct instead of a sliver around 0.
+export const GAS_Y_DOMAIN: YDomainOptions = { includeZero: true, flatSpan: 100 };
 
 // dm3 -> m3: matches the unit gasmeters and bills are normally read in.
 export function formatM3(dm3: number): string {
@@ -42,7 +50,9 @@ interface GasChartProps {
 export function GasChart({ period, start, end, baseline, points }: GasChartProps) {
   const deltaPoints = useMemo(() => gasDeltas(points, baseline), [points, baseline]);
   const total = useMemo(() => gasNetTotal(points, baseline), [points, baseline]);
-  const domainY = useMemo(() => computeYDomain(deltaPoints, GAS_KEYS), [deltaPoints]);
+  const tariffs = useTariffs();
+  const cost = useMemo(() => (tariffs ? gasCost(points, baseline, tariffs) : null), [points, baseline, tariffs]);
+  const domainY = useMemo(() => computeYDomain(deltaPoints, GAS_KEYS, GAS_Y_DOMAIN), [deltaPoints]);
   const {
     rangeX,
     rangeY,
@@ -65,10 +75,14 @@ export function GasChart({ period, start, end, baseline, points }: GasChartProps
     canResetY,
   } = useAxisZoom({ start, end }, domainY);
   const ticks = useMemo(() => computeTicks(rangeX.start, rangeX.end), [rangeX.start, rangeX.end]);
+  const valueTicks = useMemo(() => computeValueTicks(rangeY.start, rangeY.end, 8), [rangeY.start, rangeY.end]);
 
   return (
     <div>
-      <p className="net-total">Verbruikt: {formatM3Summary(total)}</p>
+      <p className="net-total">
+        Verbruikt: {formatM3Summary(total)}
+        {cost !== null && ` (${formatEuro(cost)})`}
+      </p>
       <div className="chart-area">
         <AxisScrollbar orientation="vertical" domain={domainY} range={rangeY} onChange={setRangeY} onPage={pageY} />
         <ZoomIconGutter
@@ -97,10 +111,12 @@ export function GasChart({ period, start, end, baseline, points }: GasChartProps
                 <YAxis
                   width={Y_AXIS_WIDTH}
                   domain={[rangeY.start, rangeY.end]}
+                  ticks={valueTicks}
                   allowDataOverflow
                   tickFormatter={formatM3}
                   tick={{ fontSize: AXIS_TICK_FONT_SIZE }}
                 />
+                <ReferenceLine y={0} className="zero-line" />
                 <Tooltip labelFormatter={(t) => formatTooltipLabel(period, t)} formatter={formatTooltipValueM3} />
                 {GAS_SERIES.map((s) => (
                   <Line key={s.dataKey} type="monotone" dataKey={s.dataKey} stroke={s.color} dot={false} name={s.name} isAnimationActive={false} />
